@@ -30,14 +30,15 @@ BOT_TOKEN = os.environ.get("BOT_TOKEN")
 if not BOT_TOKEN:
     raise RuntimeError("متغیر محیطی BOT_TOKEN تنظیم نشده است.")
 
+# آیدی‌های ادمین (جداشده با کاما)
 ADMIN_IDS = {
     int(x) for x in os.environ.get("ADMIN_IDS", "").split(",") if x.strip().isdigit()
 }
 
-# آیدی یا یوزرنیم کانال برای عضویت اجباری (مثال: @my_channel)
+# آیدی یا یوزرنیم کانال جهت عضویت اجباری (مثال: @my_channel)
 CHANNEL_USERNAME = os.environ.get("CHANNEL_USERNAME", "").strip()
 
-# تنظیمات کوکی یوتیوب
+# تنظیمات کوکی یوتیوب جهت دور زدن لیمیت سرور
 YOUTUBE_COOKIES = os.environ.get("YOUTUBE_COOKIES", "").strip()
 COOKIE_FILE_PATH = "/tmp/cookies.txt"
 if YOUTUBE_COOKIES:
@@ -56,7 +57,7 @@ stats_lock = asyncio.Lock()
 RATE_LIMIT_SECONDS = 20
 last_request_time = {}  # user_id -> timestamp
 
-# کش کردن لینک‌ها برای ۱ ساعت جهت جلوگیری از پر شدن RAM
+# کش کردن لینک‌ها برای ۱ ساعت جهت مدیریت RAM سرور
 url_cache = TTLCache(maxsize=1000, ttl=3600)
 MAX_CAPTION_LEN = 500
 
@@ -76,7 +77,7 @@ SUPPORTED_DOMAINS = [
 
 
 # ---------------------------------------------------------------------------
-# آمار و دیتابیس ساده روی JSON
+# آمار و ذخیره‌سازی داده‌ها
 # ---------------------------------------------------------------------------
 def load_stats():
     if os.path.exists(STATS_FILE):
@@ -139,7 +140,7 @@ async def record_error():
 
 
 # ---------------------------------------------------------------------------
-# بررسی عضویت در کانال و دسترسی‌ها
+# بررسی عضویت در کانال
 # ---------------------------------------------------------------------------
 async def is_channel_member(bot, user_id: int) -> bool:
     if not CHANNEL_USERNAME or user_id in ADMIN_IDS:
@@ -153,7 +154,7 @@ async def is_channel_member(bot, user_id: int) -> bool:
         ]
     except Exception as e:
         logger.warning(f"خطا در بررسی عضویت کانال: {e}")
-        return True  # در صورت خطا یا عدم دسترسی ربات، مانع کاربر نمی‌شویم
+        return True
 
 
 # ---------------------------------------------------------------------------
@@ -231,7 +232,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if stats.get("maintenance", False) and user.id not in ADMIN_IDS:
-        await update.message.reply_text("🛠 ربات در حال حاضر در دست تعمیرات و به‌روزرسانی است. لطفاً بعداً مراجعه کنید.")
+        await update.message.reply_text("🛠 ربات در حال حاضر در دست تعمیرات است. لطفاً بعداً مراجعه کنید.")
         return
 
     text = (
@@ -251,7 +252,10 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     if user_id not in ADMIN_IDS:
-        await update.message.reply_text("⛔️ این دستور فقط برای ادمین‌هاست.")
+        await update.message.reply_text(
+            f"⛔️ دسترسی غیرمجاز!\nآیدی عددی شما (`{user_id}`) در لیست ادمین‌ها ست نشده است.",
+            parse_mode=ParseMode.MARKDOWN,
+        )
         return
 
     total_users = len(stats["users"])
@@ -282,7 +286,12 @@ async def admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id not in ADMIN_IDS:
+    user_id = update.effective_user.id
+    if user_id not in ADMIN_IDS:
+        await update.message.reply_text(
+            f"⛔️ دسترسی غیرمجاز!\nآیدی عددی شما (`{user_id}`) در لیست ادمین‌ها ست نشده است.",
+            parse_mode=ParseMode.MARKDOWN,
+        )
         return
 
     msg_to_send = update.message.reply_to_message
@@ -290,13 +299,14 @@ async def broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if not msg_to_send and not text:
         await update.message.reply_text(
-            "⚠️ لطفاً روی یک پیام ریپلای کنید یا متن پیام همگانی را بعد از دستور بنویسید.\n"
-            "مثال: `/broadcast سلام دوستان`",
+            "⚠️ *راهنمای استفاده از دستور همگانی:*\n\n"
+            "۱️⃣ **پیام متنی:** `/broadcast متن پیام شما`\n"
+            "۲️⃣ **عکس/ویدیو/فایل:** عکس یا فیلمی ارسال کنید، سپس روی آن ریپلای کرده و بنویسید `/broadcast`",
             parse_mode=ParseMode.MARKDOWN,
         )
         return
 
-    status_msg = await update.message.reply_text("🚀 در حال ارسال پیام همگانی به تمامی کاربران...")
+    status_msg = await update.message.reply_text("🚀 در حال ارسال پیام همگانی...")
     success, failed = 0, 0
 
     for uid_str in list(stats["users"].keys()):
@@ -307,12 +317,12 @@ async def broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
             else:
                 await context.bot.send_message(chat_id=uid, text=text)
             success += 1
-            await asyncio.sleep(0.04)  # برای جلوگیری از خطای Flood تلگرام
+            await asyncio.sleep(0.04)  # رعایت لیمیت ارسال پیام تلگرام
         except Exception:
             failed += 1
 
     await status_msg.edit_text(
-        f"📊 *گزارش ارسال پیام همگانی:*\n\n"
+        f"📊 *گزارش ارسال همگانی:*\n\n"
         f"✅ ارسال موفق: {success}\n"
         f"❌ ناموفق / بلاک‌شده: {failed}",
         parse_mode=ParseMode.MARKDOWN,
@@ -358,11 +368,11 @@ async def toggle_maintenance(update: Update, context: ContextTypes.DEFAULT_TYPE)
         status = "فعال 🛠" if stats["maintenance"] else "غیرفعال 🟢"
         save_stats(stats)
 
-    await update.message.reply_text(f"⚙️ حالت تعمیرات با موفقیت تغییر کرد:\nوضعیت جدید: *{status}*", parse_mode=ParseMode.MARKDOWN)
+    await update.message.reply_text(f"⚙️ وضعیت تعمیرات تغییر کرد:\nوضعیت جدید: *{status}*", parse_mode=ParseMode.MARKDOWN)
 
 
 # ---------------------------------------------------------------------------
-# دکمه‌ها و کلیک‌ها
+# پردازش دکمه‌ها
 # ---------------------------------------------------------------------------
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -457,31 +467,30 @@ def check_rate_limit(user_id: int):
 
 
 # ---------------------------------------------------------------------------
-# دریافت و پردازش لینک
+# دریافت لینک
 # ---------------------------------------------------------------------------
 async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     await record_user(user.id, user.username)
 
     if user.id in stats.get("banned", []):
-        await update.message.reply_text("🚫 شما از استفاده از ربات مسدود شده‌اید.")
+        await update.message.reply_text("🚫 شما مسدود شده‌اید.")
         return
 
     if stats.get("maintenance", False) and user.id not in ADMIN_IDS:
-        await update.message.reply_text("🛠 ربات در حال تعمیرات است. لطفاً بعداً تلاش کنید.")
+        await update.message.reply_text("🛠 ربات در حال تعمیرات است.")
         return
 
-    # بررسی عضویت اجباری
     if not await is_channel_member(context.bot, user.id):
         await update.message.reply_text(
-            f"⚠️ برای استفاده از ربات، ابتدا باید در کانال زیر عضو شوید:",
+            "⚠️ برای استفاده از ربات، ابتدا باید در کانال عضو شوید:",
             reply_markup=force_join_keyboard(),
         )
         return
 
     url = update.message.text.strip()
 
-    # پاک‌سازی لینک تیک‌تاک از پارامترهای اضافی
+    # حذف پارامترهای اضافی تیک‌تاک
     if "tiktok.com" in url and "?" in url:
         url = url.split("?")[0]
 
@@ -513,7 +522,7 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ---------------------------------------------------------------------------
-# صف‌بندی و دانلود
+# افزودن به صف و پردازش دانلود
 # ---------------------------------------------------------------------------
 async def enqueue_download(chat_message, user, url, quality):
     job_id = uuid.uuid4().hex[:10]
@@ -708,7 +717,7 @@ async def process_job(job):
 
 
 # ---------------------------------------------------------------------------
-# ورکرهای صف و اجرای ربات
+# ورکرهای صف و اجرای اصلی
 # ---------------------------------------------------------------------------
 async def queue_worker():
     while True:
@@ -732,21 +741,22 @@ def main():
     # دستورات عمومی
     app.add_handler(CommandHandler("start", start))
 
-    # دستورات مدیریت و ادمین
+    # دستورات مدیریت (با پشتیبانی از متن و کپشن رسانه برای همگانی)
     app.add_handler(CommandHandler("admin", admin_panel))
-    app.add_handler(CommandHandler("broadcast", broadcast))
+    app.add_handler(CommandHandler("broadcast", broadcast, filters=filters.TEXT | filters.CAPTION))
     app.add_handler(CommandHandler("ban", ban_user))
     app.add_handler(CommandHandler("unban", unban_user))
     app.add_handler(CommandHandler("off", toggle_maintenance))
     app.add_handler(CommandHandler("on", toggle_maintenance))
 
-    # دکمه‌ها و لینک‌ها
+    # هندلر دکمه‌ها و لینک‌ها
     app.add_handler(CallbackQueryHandler(button_handler))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_link))
 
-    print("ربات با تمام قابلیت‌های جدید روشن شد...")
+    print("ربات با موفقیت روشن شد...")
     app.run_polling()
 
 
 if __name__ == "__main__":
     main()
+
