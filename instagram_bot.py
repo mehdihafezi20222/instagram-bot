@@ -6,6 +6,7 @@ import uuid
 import asyncio
 import logging
 from urllib.parse import urlparse
+from cachetools import TTLCache
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
@@ -16,33 +17,47 @@ from telegram.ext import (
     ContextTypes,
     filters,
 )
-from telegram.constants import ParseMode
+from telegram.constants import ParseMode, ChatMemberStatus
 import yt_dlp
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# تنظیمات پایه
+# تنظیمات پایه و متغیرهای محیطی
 # ---------------------------------------------------------------------------
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 if not BOT_TOKEN:
     raise RuntimeError("متغیر محیطی BOT_TOKEN تنظیم نشده است.")
 
-# آیدی عددی ادمین‌ها، جدا شده با کاما — مثال: ADMIN_IDS="123456,987654"
 ADMIN_IDS = {
     int(x) for x in os.environ.get("ADMIN_IDS", "").split(",") if x.strip().isdigit()
 }
+
+# آیدی یا یوزرنیم کانال برای عضویت اجباری (مثال: @my_channel)
+CHANNEL_USERNAME = os.environ.get("CHANNEL_USERNAME", "").strip()
+
+# تنظیمات کوکی یوتیوب
+YOUTUBE_COOKIES = os.environ.get("YOUTUBE_COOKIES", "").strip()
+COOKIE_FILE_PATH = "/tmp/cookies.txt"
+if YOUTUBE_COOKIES:
+    try:
+        with open(COOKIE_FILE_PATH, "w", encoding="utf-8") as f:
+            f.write(YOUTUBE_COOKIES)
+    except Exception as e:
+        logger.error(f"خطا در ساخت فایل کوکی: {e}")
 
 DOWNLOAD_DIR = "downloads"
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
 STATS_FILE = "stats.json"
+stats_lock = asyncio.Lock()
 
 RATE_LIMIT_SECONDS = 20
-last_request_time = {}  # user_id -> timestamp آخرین درخواست
+last_request_time = {}  # user_id -> timestamp
 
-url_cache = {}  # short_id -> url (برای دکمه‌ی انتخاب کیفیت / دانلود مجدد)
+# کش کردن لینک‌ها برای ۱ ساعت جهت جلوگیری از پر شدن RAM
+url_cache = TTLCache(maxsize=1000, ttl=3600)
 MAX_CAPTION_LEN = 500
 
 MAX_FILE_SIZE_MB = int(os.environ.get("MAX_FILE_SIZE_MB", "50"))
@@ -61,16 +76,28 @@ SUPPORTED_DOMAINS = [
 
 
 # ---------------------------------------------------------------------------
-# آمار و پنل ادمین (ذخیره‌سازی ساده روی فایل JSON)
+# آمار و دیتابیس ساده روی JSON
 # ---------------------------------------------------------------------------
 def load_stats():
     if os.path.exists(STATS_FILE):
         try:
             with open(STATS_FILE, "r", encoding="utf-8") as f:
-                return json.load(f)
+                data = json.load(f)
+                data.setdefault("total_downloads", 0)
+                data.setdefault("total_errors", 0)
+                data.setdefault("users", {})
+                data.setdefault("banned", [])
+                data.setdefault("maintenance", False)
+                return data
         except Exception:
             logger.exception("خطا در خواندن فایل آمار")
-    return {"total_downloads": 0, "total_errors": 0, "users": {}}
+    return {
+        "total_downloads": 0,
+        "total_errors": 0,
+        "users": {},
+        "banned": [],
+        "maintenance": False,
+    }
 
 
 def save_stats(data):
@@ -84,25 +111,56 @@ def save_stats(data):
 stats = load_stats()
 
 
-def record_download(user_id: int, username: str):
-    stats["total_downloads"] += 1
-    u = stats["users"].setdefault(str(user_id), {"count": 0, "username": username or ""})
-    u["count"] += 1
-    if username:
-        u["username"] = username
-    save_stats(stats)
+async def record_user(user_id: int, username: str):
+    async with stats_lock:
+        uid = str(user_id)
+        if uid not in stats["users"]:
+            stats["users"][uid] = {"count": 0, "username": username or ""}
+        elif username:
+            stats["users"][uid]["username"] = username
+        save_stats(stats)
 
 
-def record_error():
-    stats["total_errors"] += 1
-    save_stats(stats)
+async def record_download(user_id: int, username: str):
+    async with stats_lock:
+        stats["total_downloads"] += 1
+        uid = str(user_id)
+        u = stats["users"].setdefault(uid, {"count": 0, "username": username or ""})
+        u["count"] += 1
+        if username:
+            u["username"] = username
+        save_stats(stats)
+
+
+async def record_error():
+    async with stats_lock:
+        stats["total_errors"] += 1
+        save_stats(stats)
+
+
+# ---------------------------------------------------------------------------
+# بررسی عضویت در کانال و دسترسی‌ها
+# ---------------------------------------------------------------------------
+async def is_channel_member(bot, user_id: int) -> bool:
+    if not CHANNEL_USERNAME or user_id in ADMIN_IDS:
+        return True
+    try:
+        member = await bot.get_chat_member(chat_id=CHANNEL_USERNAME, user_id=user_id)
+        return member.status in [
+            ChatMemberStatus.MEMBER,
+            ChatMemberStatus.ADMINISTRATOR,
+            ChatMemberStatus.OWNER,
+        ]
+    except Exception as e:
+        logger.warning(f"خطا در بررسی عضویت کانال: {e}")
+        return True  # در صورت خطا یا عدم دسترسی ربات، مانع کاربر نمی‌شویم
 
 
 # ---------------------------------------------------------------------------
 # صف دانلود
 # ---------------------------------------------------------------------------
 download_queue: "asyncio.Queue" = asyncio.Queue()
-active_jobs = {}  # job_id -> {"cancel": bool, "status_msg": Message}
+active_jobs = {}
 
 
 class DownloadCancelled(Exception):
@@ -126,6 +184,16 @@ def main_menu_keyboard():
 
 def back_keyboard():
     return InlineKeyboardMarkup([[InlineKeyboardButton("🔙 بازگشت", callback_data="back")]])
+
+
+def force_join_keyboard():
+    ch_clean = CHANNEL_USERNAME.replace("@", "")
+    return InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("📢 عضویت در کانال", url=f"https://t.me/{ch_clean}")],
+            [InlineKeyboardButton("✅ بررسی عضویت", callback_data="check_join")],
+        ]
+    )
 
 
 def redownload_keyboard(short_id: str):
@@ -152,13 +220,22 @@ def cancel_keyboard(job_id: str):
 
 
 # ---------------------------------------------------------------------------
-# دستورات ساده
+# دستورات کاربران
 # ---------------------------------------------------------------------------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
-    name = user.first_name or "دوست عزیز"
+    await record_user(user.id, user.username)
+
+    if user.id in stats.get("banned", []):
+        await update.message.reply_text("🚫 شما از استفاده از این ربات مسدود شده‌اید.")
+        return
+
+    if stats.get("maintenance", False) and user.id not in ADMIN_IDS:
+        await update.message.reply_text("🛠 ربات در حال حاضر در دست تعمیرات و به‌روزرسانی است. لطفاً بعداً مراجعه کنید.")
+        return
+
     text = (
-        f"✨ *سلام {name} 👋، به ربات دانلودر خوش اومدی!*\n\n"
+        f"✨ *سلام {user.first_name or 'دوست عزیز'} 👋، به ربات دانلودر خوش اومدی!*\n\n"
         "🔗 لینک پست، ریلز یا استوری اینستاگرام، یا لینک یوتیوب، توییتر/X، تیک‌تاک و فیسبوک "
         "رو برام بفرست تا برات دانلودش کنم.\n\n"
         "👇 برای شروع یکی از گزینه‌های زیر رو انتخاب کن یا مستقیم لینک بفرست:"
@@ -168,6 +245,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+# ---------------------------------------------------------------------------
+# دستورات مدیریتی ادمین
+# ---------------------------------------------------------------------------
 async def admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     if user_id not in ADMIN_IDS:
@@ -175,13 +255,20 @@ async def admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     total_users = len(stats["users"])
+    banned_count = len(stats.get("banned", []))
+    maint_status = "فعال 🛠" if stats.get("maintenance", False) else "غیرفعال 🟢"
+    ch_status = CHANNEL_USERNAME if CHANNEL_USERNAME else "تنظیم نشده ❌"
+
     text = (
-        "📊 *پنل آمار ربات*\n\n"
-        f"👥 تعداد کاربران: {total_users}\n"
+        "📊 *پنل مدیریت ربات*\n\n"
+        f"👥 تعداد کل کاربران: {total_users}\n"
         f"📥 مجموع دانلودهای موفق: {stats['total_downloads']}\n"
         f"❌ مجموع خطاها: {stats['total_errors']}\n"
         f"⏳ اندازه صف فعلی: {download_queue.qsize()}\n"
         f"🔄 دانلودهای درحال اجرا: {len(active_jobs)}\n"
+        f"🛠 حالت تعمیرات: {maint_status}\n"
+        f"🚫 کاربران مسدود شده: {banned_count}\n"
+        f"📢 کانال عضویت اجباری: {ch_status}\n"
     )
 
     top = sorted(stats["users"].items(), key=lambda kv: kv[1]["count"], reverse=True)[:5]
@@ -194,13 +281,106 @@ async def admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
 
 
+async def broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id not in ADMIN_IDS:
+        return
+
+    msg_to_send = update.message.reply_to_message
+    text = " ".join(context.args)
+
+    if not msg_to_send and not text:
+        await update.message.reply_text(
+            "⚠️ لطفاً روی یک پیام ریپلای کنید یا متن پیام همگانی را بعد از دستور بنویسید.\n"
+            "مثال: `/broadcast سلام دوستان`",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return
+
+    status_msg = await update.message.reply_text("🚀 در حال ارسال پیام همگانی به تمامی کاربران...")
+    success, failed = 0, 0
+
+    for uid_str in list(stats["users"].keys()):
+        try:
+            uid = int(uid_str)
+            if msg_to_send:
+                await msg_to_send.copy(chat_id=uid)
+            else:
+                await context.bot.send_message(chat_id=uid, text=text)
+            success += 1
+            await asyncio.sleep(0.04)  # برای جلوگیری از خطای Flood تلگرام
+        except Exception:
+            failed += 1
+
+    await status_msg.edit_text(
+        f"📊 *گزارش ارسال پیام همگانی:*\n\n"
+        f"✅ ارسال موفق: {success}\n"
+        f"❌ ناموفق / بلاک‌شده: {failed}",
+        parse_mode=ParseMode.MARKDOWN,
+    )
+
+
+async def ban_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id not in ADMIN_IDS:
+        return
+    if not context.args or not context.args[0].isdigit():
+        await update.message.reply_text("⚠️ فرمت صحیح: `/ban 12345678`", parse_mode=ParseMode.MARKDOWN)
+        return
+
+    uid = int(context.args[0])
+    async with stats_lock:
+        if uid not in stats["banned"]:
+            stats["banned"].append(uid)
+            save_stats(stats)
+    await update.message.reply_text(f"🚫 کاربر `{uid}` با موفقیت مسدود شد.", parse_mode=ParseMode.MARKDOWN)
+
+
+async def unban_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id not in ADMIN_IDS:
+        return
+    if not context.args or not context.args[0].isdigit():
+        await update.message.reply_text("⚠️ فرمت صحیح: `/unban 12345678`", parse_mode=ParseMode.MARKDOWN)
+        return
+
+    uid = int(context.args[0])
+    async with stats_lock:
+        if uid in stats["banned"]:
+            stats["banned"].remove(uid)
+            save_stats(stats)
+    await update.message.reply_text(f"✅ کاربر `{uid}` از مسدودی خارج شد.", parse_mode=ParseMode.MARKDOWN)
+
+
+async def toggle_maintenance(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id not in ADMIN_IDS:
+        return
+
+    async with stats_lock:
+        stats["maintenance"] = not stats.get("maintenance", False)
+        status = "فعال 🛠" if stats["maintenance"] else "غیرفعال 🟢"
+        save_stats(stats)
+
+    await update.message.reply_text(f"⚙️ حالت تعمیرات با موفقیت تغییر کرد:\nوضعیت جدید: *{status}*", parse_mode=ParseMode.MARKDOWN)
+
+
 # ---------------------------------------------------------------------------
-# دکمه‌ها
+# دکمه‌ها و کلیک‌ها
 # ---------------------------------------------------------------------------
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     data = query.data
+    user = query.from_user
+
+    if user.id in stats.get("banned", []):
+        await query.message.reply_text("🚫 شما مسدود هستید.")
+        return
+
+    if data == "check_join":
+        if await is_channel_member(context.bot, user.id):
+            await query.message.delete()
+            await query.message.reply_text("✅ عضویت شما تایید شد! حالا می‌تونید لینکتون رو بفرستید.")
+        else:
+            await query.answer("❌ شما هنوز در کانال عضو نشده‌اید!", show_alert=True)
+        return
 
     if data == "help":
         text = (
@@ -208,11 +388,9 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "۱️⃣ لینک پست/ریلز/استوری اینستاگرام یا لینک یوتیوب، توییتر/X، تیک‌تاک و فیسبوک رو کپی کن\n"
             "۲️⃣ همینجا برام بفرستش\n"
             "۳️⃣ کیفیت موردنظرت رو انتخاب کن\n"
-            "۴️⃣ اگه صف شلوغ بود منتظر می‌مونی، وگرنه فوراً دانلود می‌شه 🎬\n"
-            "۵️⃣ هر موقع خواستی می‌تونی دانلود در حال انجام رو لغو کنی\n\n"
+            "۴️⃣ اگه صف شلوغ بود منتظر می‌مونی، وگرنه فوراً دانلود می‌شه 🎬\n\n"
             f"⏱ بین هر درخواست حداقل {RATE_LIMIT_SECONDS} ثانیه فاصله لازمه.\n"
-            f"📦 حداکثر حجم مجاز هر فایل: {MAX_FILE_SIZE_MB} مگابایت.\n"
-            "⚠️ *توجه:* پست‌های اکانت‌های خصوصی پشتیبانی نمی‌شن."
+            f"📦 حداکثر حجم مجاز هر فایل: {MAX_FILE_SIZE_MB} مگابایت."
         )
         await query.edit_message_text(text, reply_markup=back_keyboard(), parse_mode=ParseMode.MARKDOWN)
 
@@ -226,11 +404,9 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text(text, reply_markup=back_keyboard(), parse_mode=ParseMode.MARKDOWN)
 
     elif data == "back":
-        user = query.from_user
         text = (
             f"✨ *سلام {user.first_name or 'دوست عزیز'} 👋*\n\n"
-            "🔗 لینک موردنظرت رو برام بفرست.\n\n"
-            "👇 یکی از گزینه‌های زیر رو انتخاب کن یا مستقیم لینک بفرست:"
+            "🔗 لینک موردنظرت رو برام بفرست:"
         )
         await query.edit_message_text(text, reply_markup=main_menu_keyboard(), parse_mode=ParseMode.MARKDOWN)
 
@@ -281,10 +457,34 @@ def check_rate_limit(user_id: int):
 
 
 # ---------------------------------------------------------------------------
-# دریافت لینک از کاربر
+# دریافت و پردازش لینک
 # ---------------------------------------------------------------------------
 async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    await record_user(user.id, user.username)
+
+    if user.id in stats.get("banned", []):
+        await update.message.reply_text("🚫 شما از استفاده از ربات مسدود شده‌اید.")
+        return
+
+    if stats.get("maintenance", False) and user.id not in ADMIN_IDS:
+        await update.message.reply_text("🛠 ربات در حال تعمیرات است. لطفاً بعداً تلاش کنید.")
+        return
+
+    # بررسی عضویت اجباری
+    if not await is_channel_member(context.bot, user.id):
+        await update.message.reply_text(
+            f"⚠️ برای استفاده از ربات، ابتدا باید در کانال زیر عضو شوید:",
+            reply_markup=force_join_keyboard(),
+        )
+        return
+
     url = update.message.text.strip()
+
+    # پاک‌سازی لینک تیک‌تاک از پارامترهای اضافی
+    if "tiktok.com" in url and "?" in url:
+        url = url.split("?")[0]
+
     parsed = urlparse(url)
     domain = parsed.netloc.lower().replace("www.", "")
 
@@ -295,9 +495,8 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    user_id = update.effective_user.id
-    allowed, wait_left = check_rate_limit(user_id)
-    if not allowed:
+    allowed, wait_left = check_rate_limit(user.id)
+    if not allowed and user.id not in ADMIN_IDS:
         await update.message.reply_text(
             f"⏱ خیلی سریع درخواست دادی! لطفاً {wait_left} ثانیه دیگه دوباره امتحان کن."
         )
@@ -308,13 +507,13 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text(
         "🎚 کیفیت موردنظرت رو انتخاب کن:\n"
-        "(اگه لینک، پست چندعکسی/کاروسل باشه، همه‌ی آیتم‌ها با کیفیت انتخابی برات ارسال می‌شن)",
+        "(اگه لینک، پست چندعکسی/کاروسل باشه، همه‌ی آیتم‌ها ارسال می‌شن)",
         reply_markup=quality_keyboard(short_id),
     )
 
 
 # ---------------------------------------------------------------------------
-# افزودن درخواست به صف
+# صف‌بندی و دانلود
 # ---------------------------------------------------------------------------
 async def enqueue_download(chat_message, user, url, quality):
     job_id = uuid.uuid4().hex[:10]
@@ -337,14 +536,10 @@ async def enqueue_download(chat_message, user, url, quality):
         await chat_message.reply_text("⏳ درخواست شما ثبت شد، به‌زودی شروع می‌شه...")
 
 
-# ---------------------------------------------------------------------------
-# پردازش واقعی دانلود (اجرا شده توسط ورکرهای صف)
-# ---------------------------------------------------------------------------
 async def safe_edit_status(status_msg, text, parse_mode=None, reply_markup=None):
     try:
         await status_msg.edit_text(text, parse_mode=parse_mode, reply_markup=reply_markup)
     except Exception:
-        # اگه متن تغییری نکرده یا پیام حذف شده باشه، خطا رو نادیده بگیر
         pass
 
 
@@ -362,7 +557,7 @@ async def process_job(job):
     active_jobs[job_id] = {"cancel": False, "status_msg": status_msg}
 
     loop = asyncio.get_event_loop()
-    last_reported = {"percent": -1}
+    last_reported = {"percent": -1, "time": time.time()}
 
     def progress_hook(d):
         if active_jobs.get(job_id, {}).get("cancel"):
@@ -374,8 +569,11 @@ async def process_job(job):
             percent = int(float(percent_str))
         except (ValueError, TypeError):
             return
-        if percent - last_reported["percent"] >= 20 or percent >= 99:
+
+        current_time = time.time()
+        if (percent - last_reported["percent"] >= 15) and (current_time - last_reported["time"] >= 2.5):
             last_reported["percent"] = percent
+            last_reported["time"] = current_time
             asyncio.run_coroutine_threadsafe(
                 safe_edit_status(
                     status_msg,
@@ -392,7 +590,6 @@ async def process_job(job):
     }
     fmt = format_map.get(quality, "best")
 
-    # هر دانلود پوشه‌ی موقت مخصوص به خودش رو داره تا فایل‌های کاربران مختلف قاطی نشن
     job_dir = os.path.join(DOWNLOAD_DIR, job_id)
     os.makedirs(job_dir, exist_ok=True)
 
@@ -400,9 +597,13 @@ async def process_job(job):
         "outtmpl": f"{job_dir}/%(id)s.%(ext)s",
         "format": fmt,
         "quiet": True,
-        "noplaylist": False,  # اجازه بده کاروسل‌ها (چند آیتمی) کامل دانلود بشن
+        "noplaylist": False,
         "progress_hooks": [progress_hook],
     }
+
+    if os.path.exists(COOKIE_FILE_PATH):
+        ydl_opts["cookiefile"] = COOKIE_FILE_PATH
+
     if quality == "audio":
         ydl_opts["postprocessors"] = [
             {
@@ -416,8 +617,8 @@ async def process_job(job):
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = await loop.run_in_executor(None, lambda: ydl.extract_info(url, True))
-
             entries = info.get("entries") if info.get("_type") == "playlist" else [info]
+
             for entry in entries:
                 if entry is None:
                     continue
@@ -449,8 +650,7 @@ async def process_job(job):
             if size > max_bytes:
                 await chat_message.reply_text(
                     f"⚠️ فایل شماره {idx} از {total} حجمش حدود {size // (1024 * 1024)} مگابایته "
-                    f"و از حد مجاز ({MAX_FILE_SIZE_MB} مگابایت) بیشتره، ارسال نشد.\n"
-                    "می‌تونی کیفیت پایین‌تری انتخاب کنی."
+                    f"و از حد مجاز ({MAX_FILE_SIZE_MB} مگابایت) بیشتره."
                 )
                 continue
 
@@ -461,7 +661,7 @@ async def process_job(job):
                     caption_parts.append(f"\n📝 کپشن اصلی:\n{original_caption}")
             if total > 1:
                 caption_parts.append(f"\n({idx}/{total})")
-            caption_parts.append("\n🙏 با تشکر از امپراطور")
+            caption_parts.append("\n🙏 با تشکر از استفاده شما")
             caption = "\n".join(caption_parts)
 
             is_last = idx == total
@@ -482,14 +682,14 @@ async def process_job(job):
             sent_any = True
 
         await status_msg.delete()
-        record_download(user_id, username)
+        await record_download(user_id, username)
 
     except DownloadCancelled:
         await safe_edit_status(status_msg, "⛔️ دانلود توسط شما لغو شد.")
 
     except Exception as e:
         logger.exception("خطا در دانلود")
-        record_error()
+        await record_error()
         await safe_edit_status(status_msg, f"❌ خطا در دانلود:\n`{e}`", parse_mode=ParseMode.MARKDOWN)
 
     finally:
@@ -508,7 +708,7 @@ async def process_job(job):
 
 
 # ---------------------------------------------------------------------------
-# ورکرهای صف
+# ورکرهای صف و اجرای ربات
 # ---------------------------------------------------------------------------
 async def queue_worker():
     while True:
@@ -526,16 +726,25 @@ async def post_init(app):
         asyncio.create_task(queue_worker())
 
 
-# ---------------------------------------------------------------------------
-# راه‌اندازی ربات
-# ---------------------------------------------------------------------------
 def main():
     app = ApplicationBuilder().token(BOT_TOKEN).post_init(post_init).build()
+
+    # دستورات عمومی
     app.add_handler(CommandHandler("start", start))
+
+    # دستورات مدیریت و ادمین
     app.add_handler(CommandHandler("admin", admin_panel))
+    app.add_handler(CommandHandler("broadcast", broadcast))
+    app.add_handler(CommandHandler("ban", ban_user))
+    app.add_handler(CommandHandler("unban", unban_user))
+    app.add_handler(CommandHandler("off", toggle_maintenance))
+    app.add_handler(CommandHandler("on", toggle_maintenance))
+
+    # دکمه‌ها و لینک‌ها
     app.add_handler(CallbackQueryHandler(button_handler))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_link))
-    print("ربات در حال اجراست...")
+
+    print("ربات با تمام قابلیت‌های جدید روشن شد...")
     app.run_polling()
 
 
