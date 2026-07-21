@@ -1,3 +1,81 @@
+import os
+import json
+import uuid
+import asyncio
+import logging
+from urllib.parse import urlparse
+from cachetools import TTLCache
+
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import (
+    ApplicationBuilder,
+    CommandHandler,
+    MessageHandler,
+    CallbackQueryHandler,
+    ContextTypes,
+    filters,
+)
+from telegram.constants import ParseMode, ChatMemberStatus
+import yt_dlp
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# تنظیمات پایه
+# ---------------------------------------------------------------------------
+BOT_TOKEN = os.environ.get("BOT_TOKEN")
+if not BOT_TOKEN:
+    raise RuntimeError("متغیر BOT_TOKEN در Railway تنظیم نشده است.")
+
+ADMIN_IDS = set()
+raw_admins = os.environ.get("ADMIN_IDS", "").replace(" ", "").split(",")
+for x in raw_admins:
+    if x.isdigit():
+        ADMIN_IDS.add(int(x))
+
+CHANNEL_USERNAME = os.environ.get("CHANNEL_USERNAME", "").strip()
+DOWNLOAD_DIR = "downloads"
+os.makedirs(DOWNLOAD_DIR, exist_ok=True)
+
+STATS_FILE = "stats.json"
+stats_lock = asyncio.Lock()
+
+url_cache = TTLCache(maxsize=1000, ttl=3600)
+
+SUPPORTED_DOMAINS = [
+    "instagram.com", "youtube.com", "youtu.be",
+    "twitter.com", "x.com", "tiktok.com", "facebook.com", "fb.watch"
+]
+
+IMAGE_EXTS = (".jpg", ".jpeg", ".png", ".webp")
+AUDIO_EXTS = (".mp3", ".m4a", ".aac", ".ogg", ".wav", ".opus")
+
+# ---------------------------------------------------------------------------
+# دیتابیس ساده JSON
+# ---------------------------------------------------------------------------
+def load_stats():
+    if os.path.exists(STATS_FILE):
+        try:
+            with open(STATS_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                data.setdefault("total_downloads", 0)
+                data.setdefault("total_errors", 0)
+                data.setdefault("users", {})
+                data.setdefault("banned", [])
+                data.setdefault("maintenance", False)
+                return data
+        except Exception:
+            pass
+    return {"total_downloads": 0, "total_errors": 0, "users": {}, "banned": [], "maintenance": False}
+
+def save_stats(data):
+    try:
+        with open(STATS_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
+
 stats = load_stats()
 
 async def record_user(user_id: int, username: str):
@@ -41,7 +119,7 @@ def quality_keyboard(short_id: str):
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("🎬 بهترین کیفیت (ویدیو)", callback_data=f"q:best:{short_id}")],
         [InlineKeyboardButton("📺 کیفیت متوسط (720p)", callback_data=f"q:720:{short_id}")],
-        [InlineKeyboardButton("🎧 فقط صدا (موزیک/MP3)", callback_data=f"q:audio:{short_id}")],
+        [InlineKeyboardButton("🎧 فقط صدا (MP3)", callback_data=f"q:audio:{short_id}")],
         [InlineKeyboardButton("❌ انصراف", callback_data="cancel_select")]
     ])
 
@@ -94,13 +172,13 @@ async def broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     msg_to_send = update.message.reply_to_message
-    text = " ".join(context.args)
+    text = " ".join(context.args) if context.args else ""
 
     if not msg_to_send and not text:
         await update.message.reply_text(
             "⚠️ *نحوه استفاده از دستور همگانی:*\n\n"
-            "۱️⃣ **پیام متنی:** `/broadcast سلام به همه`\n"
-            "۲️⃣ **عکس/ویدیو:** یک عکس بفرستید، روی آن ریپلای کرده و بنویسید `/broadcast`",
+            "۱️⃣ *پیام متنی:* `/broadcast سلام به همه`\n"
+            "۲️⃣ *عکس/ویدیو:* یک عکس بفرستید، روی آن ریپلای کرده و بنویسید `/broadcast`",
             parse_mode=ParseMode.MARKDOWN
         )
         return
@@ -120,28 +198,38 @@ async def broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception:
             failed += 1
 
-    await status_msg.edit_text(f"📊 *گزارش ارسال همگانی:*\n\n✅ موفق: {success}\n❌ ناموفق: {failed}", parse_mode=ParseMode.MARKDOWN)
+    await status_msg.edit_text(
+        f"📊 *گزارش ارسال همگانی:*\n\n✅ موفق: {success}\n❌ ناموفق: {failed}",
+        parse_mode=ParseMode.MARKDOWN
+    )
 
 async def ban_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id not in ADMIN_IDS: return
+    if update.effective_user.id not in ADMIN_IDS:
+        return
     if context.args and context.args[0].isdigit():
         uid = int(context.args[0])
         if uid not in stats["banned"]:
             stats["banned"].append(uid)
             save_stats(stats)
         await update.message.reply_text(f"🚫 کاربر {uid} مسدود شد.")
+    else:
+        await update.message.reply_text("استفاده: `/ban USER_ID`", parse_mode=ParseMode.MARKDOWN)
 
 async def unban_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id not in ADMIN_IDS: return
+    if update.effective_user.id not in ADMIN_IDS:
+        return
     if context.args and context.args[0].isdigit():
         uid = int(context.args[0])
         if uid in stats["banned"]:
             stats["banned"].remove(uid)
             save_stats(stats)
         await update.message.reply_text(f"✅ کاربر {uid} آزاد شد.")
+    else:
+        await update.message.reply_text("استفاده: `/unban USER_ID`", parse_mode=ParseMode.MARKDOWN)
 
 async def toggle_maintenance(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id not in ADMIN_IDS: return
+    if update.effective_user.id not in ADMIN_IDS:
+        return
     stats["maintenance"] = not stats.get("maintenance", False)
     save_stats(stats)
     await update.message.reply_text(f"⚙️ حالت تعمیرات: {'فعال 🛠' if stats['maintenance'] else 'غیرفعال 🟢'}")
@@ -153,7 +241,8 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     await record_user(user.id, user.username)
 
-    if user.id in stats.get("banned", []): return
+    if user.id in stats.get("banned", []):
+        return
     if stats.get("maintenance", False) and user.id not in ADMIN_IDS:
         await update.message.reply_text("🛠 ربات در حال تعمیرات است.")
         return
@@ -213,21 +302,31 @@ async def download_and_send(chat_msg, user, url, quality):
     job_dir = os.path.join(DOWNLOAD_DIR, job_id)
     os.makedirs(job_dir, exist_ok=True)
 
-    # تنظیمات اختصاصی yt-dlp برای جلوگیری از بن یوتیوب و مشکلات صدا/عکس
     ydl_opts = {
-        'outtmpl': f'{job_dir}/%(id)s_%(no)s.%(ext)s',
+        'outtmpl': f'{job_dir}/%(id)s_%(autonumber)s.%(ext)s',
         'quiet': True,
         'no_warnings': True,
         'ignoreerrors': True,
-        'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'user_agent': ('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
+                        '(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'),
+        # کمک به دور زدن محدودیت‌های اخیر یوتیوب
+        'extractor_args': {
+            'youtube': {'player_client': ['android', 'web']}
+        },
     }
 
     if quality == "audio":
+        # برای صدا حتماً باید تبدیل به mp3 انجام بشه، وگرنه فایل خام (وبم/اپوس) دانلود می‌شه
         ydl_opts['format'] = 'bestaudio/best'
+        ydl_opts['postprocessors'] = [{
+            'key': 'FFmpegExtractAudio',
+            'preferredcodec': 'mp3',
+            'preferredquality': '192',
+        }]
     elif quality == "720":
         ydl_opts['format'] = 'best[height<=720]/best'
-    else:
-        ydl_opts['format'] = 'best'
+    # برای quality == "best" فرمت رو مشخص نمی‌کنیم تا پست‌های عکسی/اسلایدشو
+    # (مثل کاروسل تیک‌تاک) هم درست دانلود بشن، نه فقط ویدیو
 
     loop = asyncio.get_event_loop()
     try:
@@ -237,7 +336,7 @@ async def download_and_send(chat_msg, user, url, quality):
 
         info = await loop.run_in_executor(None, _extract)
         if not info:
-            raise RuntimeError("اطلاعاتی دریافت نشد.")
+            raise RuntimeError("اطلاعاتی دریافت نشد. ممکنه لینک خصوصی یا نامعتبر باشه.")
 
         files = [os.path.join(job_dir, f) for f in os.listdir(job_dir) if os.path.isfile(os.path.join(job_dir, f))]
         if not files:
@@ -248,9 +347,9 @@ async def download_and_send(chat_msg, user, url, quality):
         for fname in files:
             lower = fname.lower()
             with open(fname, "rb") as f:
-                if lower.endswith((".jpg", ".jpeg", ".png", ".webp")):
+                if lower.endswith(IMAGE_EXTS):
                     await chat_msg.reply_photo(photo=f, caption="✅ دانلود شد!")
-                elif lower.endswith((".mp3", ".m4a", ".aac", ".ogg", ".wav")):
+                elif lower.endswith(AUDIO_EXTS):
                     await chat_msg.reply_audio(audio=f, caption="✅ فایل صوتی دانلود شد!")
                 else:
                     await chat_msg.reply_video(video=f, caption="✅ ویدیو دانلود شد!")
@@ -259,17 +358,21 @@ async def download_and_send(chat_msg, user, url, quality):
         await record_download(user.id)
 
     except Exception as e:
-        logger.exception("خطا")
+        logger.exception("خطا در دانلود")
         await record_error()
-        await status_msg.edit_text(f"❌ خطا در دانلود:\n`{e}`", parse_mode=ParseMode.MARKDOWN)
+        err_text = str(e)[:300]
+        await status_msg.edit_text(f"❌ خطا در دانلود:\n`{err_text}`", parse_mode=ParseMode.MARKDOWN)
 
     finally:
-        # پاک‌سازی فایل‌های موقت
         for f in os.listdir(job_dir):
-            try: os.remove(os.path.join(job_dir, f))
-            except Exception: pass
-        try: os.rmdir(job_dir)
-        except Exception: pass
+            try:
+                os.remove(os.path.join(job_dir, f))
+            except Exception:
+                pass
+        try:
+            os.rmdir(job_dir)
+        except Exception:
+            pass
 
 # ---------------------------------------------------------------------------
 # اجرای اصلی
@@ -279,7 +382,7 @@ def main():
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("admin", admin_panel))
-    app.add_handler(CommandHandler("broadcast", broadcast, filters=filters.TEXT | filters.CAPTION))
+    app.add_handler(CommandHandler("broadcast", broadcast))
     app.add_handler(CommandHandler("ban", ban_user))
     app.add_handler(CommandHandler("unban", unban_user))
     app.add_handler(CommandHandler("off", toggle_maintenance))
