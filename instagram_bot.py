@@ -48,6 +48,10 @@ stats_lock = asyncio.Lock()
 
 url_cache = TTLCache(maxsize=1000, ttl=3600)
 
+# محدودیت تعداد دانلود همزمان تا سرور اورلود نشه
+MAX_CONCURRENT_DOWNLOADS = int(os.environ.get("MAX_CONCURRENT_DOWNLOADS", "3"))
+download_semaphore = asyncio.Semaphore(MAX_CONCURRENT_DOWNLOADS)
+
 SUPPORTED_DOMAINS = [
     "instagram.com", "youtube.com", "youtu.be",
     "twitter.com", "x.com", "tiktok.com", "facebook.com", "fb.watch"
@@ -55,6 +59,12 @@ SUPPORTED_DOMAINS = [
 
 IMAGE_EXTS = (".jpg", ".jpeg", ".png", ".webp")
 AUDIO_EXTS = (".mp3", ".m4a", ".aac", ".ogg", ".wav", ".opus")
+
+# متن دکمه‌های منو - برای تشخیص از لینک استفاده می‌شود
+MENU_TEXTS = {
+    "📥 دانلود", "👤 پروفایل", "⚙️ تنظیمات", "🤝 تعامل",
+    "🔔 اعلان‌ها", "🚀 امکانات حرفه‌ای", "🛠 پنل ادمین", "💬 پشتیبانی",
+}
 
 # ---------------------------------------------------------------------------
 # ذخیره‌سازی ساده JSON
@@ -88,7 +98,7 @@ def save_stats(data):
         with open(STATS_FILE, "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
     except Exception:
-        pass
+        logger.exception("خطا در ذخیره stats.json")
 
 stats = load_stats()
 
@@ -261,6 +271,10 @@ async def is_channel_member(bot, user_id: int) -> bool:
             ChatMemberStatus.OWNER
         ]
     except Exception:
+        # توجه: اگر چک عضویت با خطا مواجه شود (مثلاً ربات ادمین کانال نیست)
+        # به صورت پیش‌فرض اجازه عبور داده می‌شود. اگر می‌خواهید عضویت واقعاً
+        # اجباری باشد، این مقدار را False کنید و مطمئن شوید ربات در کانال ادمین است.
+        logger.warning("خطا در بررسی عضویت کاربر %s در کانال", user_id)
         return True
 
 # ---------------------------------------------------------------------------
@@ -448,12 +462,15 @@ async def menu_text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "اگر خواستی بعداً می‌شود این بخش را به ادمین وصل کرد."
         )
 
+    else:
+        # اگر متن هیچکدام از دکمه‌های منو نبود، به‌عنوان لینک بررسی می‌شود
+        await handle_link(update, context)
+
 # ---------------------------------------------------------------------------
 # دریافت و پردازش لینک
 # ---------------------------------------------------------------------------
 async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
-    await record_user(user.id, user.username)
 
     if user.id in stats.get("banned", []):
         return
@@ -477,6 +494,10 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
     domain = parsed.netloc.lower().replace("www.", "")
 
     if not parsed.scheme.startswith("http") or not any(d in domain for d in SUPPORTED_DOMAINS):
+        await update.message.reply_text(
+            "⚠️ لینک معتبر نیست یا از این سایت‌ها پشتیبانی نمی‌شود.\n"
+            "سایت‌های پشتیبانی‌شده: اینستاگرام، یوتیوب، تیک‌تاک، توییتر/X، فیسبوک"
+        )
         return
 
     short_id = uuid.uuid4().hex[:8]
@@ -501,6 +522,16 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception:
             pass
         await query.message.reply_text("یکی از گزینه‌ها را انتخاب کن:", reply_markup=main_menu())
+        return
+
+    # -----------------------------
+    # بررسی مجدد عضویت کانال
+    # -----------------------------
+    if data == "check_join":
+        if await is_channel_member(context.bot, user.id):
+            await query.message.edit_text("✅ عضویت شما تایید شد. حالا می‌توانید لینک بفرستید.")
+        else:
+            await query.answer("⚠️ هنوز عضو کانال نشده‌اید.", show_alert=True)
         return
 
     # -----------------------------
@@ -764,59 +795,61 @@ async def download_and_send(chat_msg, user, url, quality):
 
     loop = asyncio.get_running_loop()
 
-    try:
-        def _extract():
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                return ydl.extract_info(url, download=True)
-
-        info = await loop.run_in_executor(None, _extract)
-
-        if not info:
-            raise RuntimeError("اطلاعاتی دریافت نشد. ممکنه لینک خصوصی یا نامعتبر باشه.")
-
-        files = [
-            os.path.join(job_dir, f)
-            for f in os.listdir(job_dir)
-            if os.path.isfile(os.path.join(job_dir, f))
-        ]
-
-        if not files:
-            raise RuntimeError("فایلی دانلود نشد.")
-
-        await status_msg.edit_text("📤 در حال ارسال فایل...")
-
-        for fname in files:
-            lower = fname.lower()
-            with open(fname, "rb") as f:
-                if lower.endswith(IMAGE_EXTS):
-                    await chat_msg.reply_photo(photo=f, caption="✅ دانلود شد!")
-                elif lower.endswith(AUDIO_EXTS):
-                    await chat_msg.reply_audio(audio=f, caption="✅ فایل صوتی دانلود شد!")
-                else:
-                    await chat_msg.reply_video(video=f, caption="✅ ویدیو دانلود شد!")
-
-        await status_msg.delete()
-        await record_download(user.id, url=url, quality=quality)
-
-    except Exception as e:
-        logger.exception("خطا در دانلود")
-        await record_error()
-        err_text = str(e)[:300]
+    # محدودیت دانلود همزمان: تا وقتی اسلات آزاد نشه صبر می‌کند
+    async with download_semaphore:
         try:
-            await status_msg.edit_text(f"❌ خطا در دانلود:\n`{err_text}`", parse_mode=ParseMode.MARKDOWN)
-        except Exception:
-            await chat_msg.reply_text(f"❌ خطا در دانلود:\n{err_text}")
+            def _extract():
+                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                    return ydl.extract_info(url, download=True)
 
-    finally:
-        for f in os.listdir(job_dir):
+            info = await loop.run_in_executor(None, _extract)
+
+            if not info:
+                raise RuntimeError("اطلاعاتی دریافت نشد. ممکنه لینک خصوصی یا نامعتبر باشه.")
+
+            files = [
+                os.path.join(job_dir, f)
+                for f in os.listdir(job_dir)
+                if os.path.isfile(os.path.join(job_dir, f))
+            ]
+
+            if not files:
+                raise RuntimeError("فایلی دانلود نشد.")
+
+            await status_msg.edit_text("📤 در حال ارسال فایل...")
+
+            for fname in files:
+                lower = fname.lower()
+                with open(fname, "rb") as f:
+                    if lower.endswith(IMAGE_EXTS):
+                        await chat_msg.reply_photo(photo=f, caption="✅ دانلود شد!")
+                    elif lower.endswith(AUDIO_EXTS):
+                        await chat_msg.reply_audio(audio=f, caption="✅ فایل صوتی دانلود شد!")
+                    else:
+                        await chat_msg.reply_video(video=f, caption="✅ ویدیو دانلود شد!")
+
+            await status_msg.delete()
+            await record_download(user.id, url=url, quality=quality)
+
+        except Exception as e:
+            logger.exception("خطا در دانلود")
+            await record_error()
+            err_text = str(e)[:300]
             try:
-                os.remove(os.path.join(job_dir, f))
+                await status_msg.edit_text(f"❌ خطا در دانلود:\n`{err_text}`", parse_mode=ParseMode.MARKDOWN)
+            except Exception:
+                await chat_msg.reply_text(f"❌ خطا در دانلود:\n{err_text}")
+
+        finally:
+            for f in os.listdir(job_dir):
+                try:
+                    os.remove(os.path.join(job_dir, f))
+                except Exception:
+                    pass
+            try:
+                os.rmdir(job_dir)
             except Exception:
                 pass
-        try:
-            os.rmdir(job_dir)
-        except Exception:
-            pass
 
 # ---------------------------------------------------------------------------
 # اجرای اصلی
@@ -836,18 +869,11 @@ def main():
 
     app.add_handler(CallbackQueryHandler(button_handler))
 
+    # یک هندلر واحد برای متن: هم منو، هم لینک را مدیریت می‌کند
     app.add_handler(
         MessageHandler(
             filters.TEXT & ~filters.COMMAND,
             menu_text_handler
-        )
-    )
-
-    # لینک‌ها بعد از منوها پردازش شوند
-    app.add_handler(
-        MessageHandler(
-            filters.TEXT & ~filters.COMMAND,
-            handle_link
         )
     )
 
