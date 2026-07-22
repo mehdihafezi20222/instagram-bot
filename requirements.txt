@@ -1,5 +1,6 @@
-python-telegram-bot==21.6
+python-telegram-bot[job-queue]==21.6
 yt-dlp>=2024.12.13
 cachetools>=5.3.0
+
 
 
