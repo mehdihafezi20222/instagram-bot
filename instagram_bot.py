@@ -1,8 +1,11 @@
 import os
 import json
 import uuid
+import shutil
+import time
 import asyncio
 import logging
+from datetime import date
 from urllib.parse import urlparse
 from cachetools import TTLCache
 
@@ -52,6 +55,18 @@ url_cache = TTLCache(maxsize=1000, ttl=3600)
 MAX_CONCURRENT_DOWNLOADS = int(os.environ.get("MAX_CONCURRENT_DOWNLOADS", "3"))
 download_semaphore = asyncio.Semaphore(MAX_CONCURRENT_DOWNLOADS)
 
+# دانلودهای در حال اجرا: job_id -> asyncio.Task (برای قابلیت لغو دانلود)
+active_downloads = {}
+
+# سقف دانلود روزانه برای کاربران عادی (ادمین و VIP نامحدودند)
+DAILY_LIMIT = int(os.environ.get("DAILY_LIMIT", "10"))
+
+# پیام تشکر که بعد از هر دانلود موفق فرستاده می‌شود
+CREDIT_MESSAGE = "🙏 با تشکر از امپراطور ۲۷"
+
+# چند ثانیه یک پوشه‌ی دانلود یتیم روی دیسک باقی بماند قبل از پاکسازی خودکار
+ORPHAN_MAX_AGE_SECONDS = 3600
+
 SUPPORTED_DOMAINS = [
     "instagram.com", "youtube.com", "youtu.be",
     "twitter.com", "x.com", "tiktok.com", "facebook.com", "fb.watch"
@@ -80,6 +95,7 @@ def load_stats():
                 data.setdefault("banned", [])
                 data.setdefault("maintenance", False)
                 data.setdefault("broadcast_count", 0)
+                data.setdefault("last_broadcast_failed", [])
                 return data
         except Exception:
             pass
@@ -91,6 +107,7 @@ def load_stats():
         "banned": [],
         "maintenance": False,
         "broadcast_count": 0,
+        "last_broadcast_failed": [],
     }
 
 def save_stats(data):
@@ -102,27 +119,31 @@ def save_stats(data):
 
 stats = load_stats()
 
+DEFAULT_USER = {
+    "count": 0,
+    "username": "",
+    "notify": True,
+    "dark": False,
+    "language": "fa",
+    "last_action": "",
+    "history": [],
+    "vip": False,
+    "daily_count": 0,
+    "daily_date": "",
+    "joined_notified": False,
+}
+
 async def record_user(user_id: int, username: str):
     async with stats_lock:
         uid = str(user_id)
         if uid not in stats["users"]:
-            stats["users"][uid] = {
-                "count": 0,
-                "username": username or "",
-                "notify": True,
-                "dark": False,
-                "language": "fa",
-                "last_action": "",
-                "history": [],
-            }
+            stats["users"][uid] = dict(DEFAULT_USER)
+            stats["users"][uid]["username"] = username or ""
         else:
             if username:
                 stats["users"][uid]["username"] = username
-            stats["users"][uid].setdefault("notify", True)
-            stats["users"][uid].setdefault("dark", False)
-            stats["users"][uid].setdefault("language", "fa")
-            stats["users"][uid].setdefault("last_action", "")
-            stats["users"][uid].setdefault("history", [])
+            for k, v in DEFAULT_USER.items():
+                stats["users"][uid].setdefault(k, v)
         save_stats(stats)
 
 async def record_download(user_id: int, url: str = "", quality: str = ""):
@@ -232,6 +253,16 @@ def quality_keyboard(short_id: str):
         [InlineKeyboardButton("❌ انصراف", callback_data="cancel_select")]
     ])
 
+def cancel_download_keyboard(job_id: str):
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("❌ لغو دانلود", callback_data=f"cancel_dl:{job_id}")]
+    ])
+
+def redo_keyboard(short_id: str):
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🔁 دانلود دوباره با کیفیت دیگه", callback_data=f"redo:{short_id}")]
+    ])
+
 def force_join_keyboard():
     ch_clean = CHANNEL_USERNAME.replace("@", "")
     return InlineKeyboardMarkup([
@@ -247,18 +278,45 @@ def is_admin(user_id: int) -> bool:
 
 def get_user_record(user_id: int):
     uid = str(user_id)
-    return stats["users"].setdefault(
-        uid,
-        {
-            "count": 0,
-            "username": "",
-            "notify": True,
-            "dark": False,
-            "language": "fa",
-            "last_action": "",
-            "history": [],
-        },
-    )
+    rec = stats["users"].setdefault(uid, dict(DEFAULT_USER))
+    for k, v in DEFAULT_USER.items():
+        rec.setdefault(k, v)
+    return rec
+
+def human_size(num_bytes):
+    try:
+        num = float(num_bytes)
+    except (TypeError, ValueError):
+        return "نامشخص"
+    for unit in ["B", "KB", "MB", "GB"]:
+        if num < 1024:
+            return f"{num:.1f} {unit}"
+        num /= 1024
+    return f"{num:.1f} TB"
+
+def queue_waiting_count():
+    waiters = getattr(download_semaphore, "_waiters", None)
+    return len(waiters) if waiters else 0
+
+def check_daily_limit(user_id: int) -> bool:
+    if is_admin(user_id):
+        return True
+    u = get_user_record(user_id)
+    if u.get("vip"):
+        return True
+    today = date.today().isoformat()
+    if u.get("daily_date") != today:
+        return True
+    return u.get("daily_count", 0) < DAILY_LIMIT
+
+def increment_daily_count(user_id: int):
+    u = get_user_record(user_id)
+    today = date.today().isoformat()
+    if u.get("daily_date") != today:
+        u["daily_date"] = today
+        u["daily_count"] = 0
+    u["daily_count"] = u.get("daily_count", 0) + 1
+    save_stats(stats)
 
 async def is_channel_member(bot, user_id: int) -> bool:
     if not CHANNEL_USERNAME or is_admin(user_id):
@@ -272,10 +330,47 @@ async def is_channel_member(bot, user_id: int) -> bool:
         ]
     except Exception:
         # توجه: اگر چک عضویت با خطا مواجه شود (مثلاً ربات ادمین کانال نیست)
-        # به صورت پیش‌فرض اجازه عبور داده می‌شود. اگر می‌خواهید عضویت واقعاً
-        # اجباری باشد، این مقدار را False کنید و مطمئن شوید ربات در کانال ادمین است.
+        # به صورت پیش‌فرض اجازه عبور داده می‌شود.
         logger.warning("خطا در بررسی عضویت کاربر %s در کانال", user_id)
         return True
+
+async def fetch_preview_info(url: str):
+    """اطلاعات سبک لینک (بدون دانلود) برای نمایش عنوان و حجم تقریبی."""
+    loop = asyncio.get_running_loop()
+
+    def _probe():
+        opts = {
+            'quiet': True,
+            'no_warnings': True,
+            'ignoreerrors': True,
+            'skip_download': True,
+            'noplaylist': True,
+            'user_agent': (
+                'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
+                'AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+            ),
+        }
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            return ydl.extract_info(url, download=False)
+
+    try:
+        return await loop.run_in_executor(None, _probe)
+    except Exception:
+        return None
+
+def estimate_size(info: dict):
+    if not info:
+        return None
+    size = info.get("filesize") or info.get("filesize_approx")
+    if size:
+        return size
+    formats = info.get("formats") or []
+    sizes = [
+        f.get("filesize") or f.get("filesize_approx")
+        for f in formats
+        if f.get("filesize") or f.get("filesize_approx")
+    ]
+    return max(sizes) if sizes else None
 
 # ---------------------------------------------------------------------------
 # پیام‌های عمومی
@@ -301,6 +396,19 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• از منو برای تنظیمات و امکانات بیشتر استفاده کن\n"
         "• ادمین‌ها می‌توانند از پنل ادمین استفاده کنند",
         reply_markup=main_menu()
+    )
+
+async def stats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    u = get_user_record(user.id)
+    await update.message.reply_text(
+        f"📊 آمار شما\n\n"
+        f"👤 نام: {user.first_name or '-'}\n"
+        f"📥 دانلودها: {u.get('count', 0)}\n"
+        f"📆 دانلود امروز: {u.get('daily_count', 0)}/{'نامحدود' if (u.get('vip') or is_admin(user.id)) else DAILY_LIMIT}\n"
+        f"🕘 آخرین فعالیت: {u.get('last_action', 'ندارد')}\n"
+        f"🔔 اعلان‌ها: {'فعال' if u.get('notify', True) else 'خاموش'}\n"
+        f"🌙 حالت شب: {'فعال' if u.get('dark', False) else 'خاموش'}"
     )
 
 # ---------------------------------------------------------------------------
@@ -351,6 +459,7 @@ async def broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     status_msg = await update.message.reply_text("🚀 در حال ارسال پیام همگانی...")
     success, failed = 0, 0
+    failed_ids = []
 
     for uid_str in list(stats["users"].keys()):
         try:
@@ -363,15 +472,20 @@ async def broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await asyncio.sleep(0.05)
         except Exception:
             failed += 1
+            failed_ids.append(uid_str)
 
     async with stats_lock:
         stats["broadcast_count"] = stats.get("broadcast_count", 0) + 1
+        stats["last_broadcast_failed"] = failed_ids
         save_stats(stats)
 
-    await status_msg.edit_text(
-        f"📊 گزارش ارسال همگانی:\n\n✅ موفق: {success}\n❌ ناموفق: {failed}",
-        parse_mode=ParseMode.MARKDOWN
-    )
+    report = f"📊 گزارش ارسال همگانی:\n\n✅ موفق: {success}\n❌ ناموفق: {failed}"
+    if failed_ids:
+        shown = ", ".join(failed_ids[:20])
+        more = "" if len(failed_ids) <= 20 else f" (+{len(failed_ids) - 20} مورد دیگر)"
+        report += f"\n\n🚫 آیدی‌های ناموفق:\n{shown}{more}"
+
+    await status_msg.edit_text(report, parse_mode=ParseMode.MARKDOWN)
 
 async def ban_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id not in ADMIN_IDS:
@@ -404,6 +518,20 @@ async def toggle_maintenance(update: Update, context: ContextTypes.DEFAULT_TYPE)
     save_stats(stats)
     await update.message.reply_text(f"⚙️ حالت تعمیرات: {'فعال 🛠' if stats['maintenance'] else 'غیرفعال 🟢'}")
 
+async def set_vip(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id not in ADMIN_IDS:
+        return
+    if context.args and context.args[0].isdigit():
+        uid = int(context.args[0])
+        u = get_user_record(uid)
+        u["vip"] = not u.get("vip", False)
+        save_stats(stats)
+        await update.message.reply_text(
+            f"⭐ وضعیت VIP کاربر {uid}: {'فعال ✅' if u['vip'] else 'غیرفعال ❌'}"
+        )
+    else:
+        await update.message.reply_text("استفاده: `/setvip USER_ID`", parse_mode=ParseMode.MARKDOWN)
+
 # ---------------------------------------------------------------------------
 # متن‌های منو
 # ---------------------------------------------------------------------------
@@ -427,7 +555,8 @@ async def menu_text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"تعداد دانلود: {u.get('count', 0)}\n"
             f"اعلان‌ها: {'فعال' if u.get('notify', True) else 'خاموش'}\n"
             f"حالت شب: {'فعال' if u.get('dark', False) else 'خاموش'}\n"
-            f"زبان: {u.get('language', 'fa')}"
+            f"زبان: {u.get('language', 'fa')}\n"
+            f"VIP: {'فعال ⭐' if u.get('vip') else 'غیرفعال'}"
         )
 
     elif text == "⚙️ تنظیمات":
@@ -467,10 +596,11 @@ async def menu_text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await handle_link(update, context)
 
 # ---------------------------------------------------------------------------
-# دریافت و پردازش لینک
+# دریافت و پردازش لینک (متن مستقیم یا کپشن پیام فوروارد‌شده)
 # ---------------------------------------------------------------------------
 async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
+    await record_user(user.id, user.username)
 
     if user.id in stats.get("banned", []):
         return
@@ -486,7 +616,11 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    url = update.message.text.strip()
+    raw_text = (update.message.text or update.message.caption or "").strip()
+    if not raw_text:
+        return
+
+    url = raw_text
     if "?" in url and ("tiktok.com" in url or "instagram.com" in url):
         url = url.split("?")[0]
 
@@ -494,15 +628,44 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
     domain = parsed.netloc.lower().replace("www.", "")
 
     if not parsed.scheme.startswith("http") or not any(d in domain for d in SUPPORTED_DOMAINS):
+        # اگر پیام صرفاً یک کپشن معمولی بدون لینک شناخته‌شده باشد، سکوت می‌کنیم
+        if update.message.text:
+            await update.message.reply_text(
+                "⚠️ لینک معتبر نیست یا از این سایت‌ها پشتیبانی نمی‌شود.\n"
+                "سایت‌های پشتیبانی‌شده: اینستاگرام، یوتیوب، تیک‌تاک، توییتر/X، فیسبوک"
+            )
+        return
+
+    if not check_daily_limit(user.id):
         await update.message.reply_text(
-            "⚠️ لینک معتبر نیست یا از این سایت‌ها پشتیبانی نمی‌شود.\n"
-            "سایت‌های پشتیبانی‌شده: اینستاگرام، یوتیوب، تیک‌تاک، توییتر/X، فیسبوک"
+            f"⛔ شما به سقف دانلود روزانه ({DAILY_LIMIT} مورد) رسیدید.\n"
+            "فردا دوباره امتحان کنید یا برای دسترسی نامحدود VIP بگیرید."
         )
         return
 
     short_id = uuid.uuid4().hex[:8]
     url_cache[short_id] = url
-    await update.message.reply_text("🎚 کیفیت مورد نظرت را انتخاب کن:", reply_markup=quality_keyboard(short_id))
+
+    status_msg = await update.message.reply_text("🔎 در حال بررسی لینک...")
+
+    preview_info = await fetch_preview_info(url)
+    title_line = ""
+    size_line = ""
+    if preview_info:
+        title = (preview_info.get("title") or "").strip()
+        if title:
+            title_line = f"🎬 {title[:150]}\n"
+        size_bytes = estimate_size(preview_info)
+        if size_bytes:
+            size_line = f"📦 حجم تقریبی: {human_size(size_bytes)}\n"
+
+    try:
+        await status_msg.edit_text(
+            f"{title_line}{size_line}\n🎚 کیفیت مورد نظرت را انتخاب کن:",
+            reply_markup=quality_keyboard(short_id)
+        )
+    except Exception:
+        await status_msg.edit_text("🎚 کیفیت مورد نظرت را انتخاب کن:", reply_markup=quality_keyboard(short_id))
 
 # ---------------------------------------------------------------------------
 # هندلر دکمه‌ها
@@ -529,7 +692,16 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # -----------------------------
     if data == "check_join":
         if await is_channel_member(context.bot, user.id):
-            await query.message.edit_text("✅ عضویت شما تایید شد. حالا می‌توانید لینک بفرستید.")
+            u = get_user_record(user.id)
+            if not u.get("joined_notified"):
+                u["joined_notified"] = True
+                save_stats(stats)
+                await query.message.edit_text(
+                    "✅ عضویت شما تایید شد. ممنون که به ما پیوستی 🙌\n"
+                    "حالا می‌تونی لینک بفرستی."
+                )
+            else:
+                await query.message.edit_text("✅ عضویت شما تایید شد. حالا می‌تونی لینک بفرستی.")
         else:
             await query.answer("⚠️ هنوز عضو کانال نشده‌اید.", show_alert=True)
         return
@@ -626,10 +798,12 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # -----------------------------
     if data == "my_stats":
         u = get_user_record(user.id)
+        limit_text = "نامحدود" if (u.get("vip") or is_admin(user.id)) else str(DAILY_LIMIT)
         await query.message.edit_text(
             f"📊 آمار شما\n\n"
             f"👤 نام: {user.first_name or '-'}\n"
             f"📥 دانلودها: {u.get('count', 0)}\n"
+            f"📆 دانلود امروز: {u.get('daily_count', 0)}/{limit_text}\n"
             f"🕘 آخرین فعالیت: {u.get('last_action', 'ندارد')}\n"
             f"🔔 اعلان‌ها: {'فعال' if u.get('notify', True) else 'خاموش'}\n"
             f"🌙 حالت شب: {'فعال' if u.get('dark', False) else 'خاموش'}"
@@ -652,10 +826,13 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if data == "vip":
+        u = get_user_record(user.id)
+        status = "فعال ✅" if u.get("vip") else "غیرفعال ❌"
         await query.message.edit_text(
-            "⭐ بخش VIP\n\n"
-            "این بخش فعلاً آماده نیست.\n"
-            "بعداً می‌توانی اینجا محدودیت دانلود، صف ویژه، یا لینک‌های اختصاصی بگذاری."
+            f"⭐ بخش VIP\n\n"
+            f"وضعیت فعلی شما: {status}\n\n"
+            "کاربران VIP از سقف دانلود روزانه معاف هستند.\n"
+            "برای فعال‌سازی با پشتیبانی در ارتباط باشید."
         )
         return
 
@@ -700,7 +877,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "🚫 مدیریت کاربران\n\n"
                 "دستورها:\n"
                 "/ban USER_ID\n"
-                "/unban USER_ID",
+                "/unban USER_ID\n"
+                "/setvip USER_ID",
                 reply_markup=admin_keyboard()
             )
             return
@@ -712,7 +890,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "• کانال اجباری\n"
                 "• حالت تعمیرات\n"
                 "• مدیریت کاربران\n"
-                "• ارسال همگانی",
+                "• ارسال همگانی\n"
+                f"• سقف دانلود روزانه: {DAILY_LIMIT}",
                 reply_markup=admin_keyboard()
             )
             return
@@ -749,6 +928,24 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.message.delete()
         return
 
+    if data.startswith("redo:"):
+        short_id = data.split(":", 1)[1]
+        url = url_cache.get(short_id)
+        if not url:
+            await query.message.edit_text("⚠️ لینک منقضی شده، لینک رو دوباره بفرست.")
+            return
+        await query.message.edit_text("🎚 کیفیت مورد نظرت را انتخاب کن:", reply_markup=quality_keyboard(short_id))
+        return
+
+    if data.startswith("cancel_dl:"):
+        job_id = data.split(":", 1)[1]
+        task = active_downloads.get(job_id)
+        if task and not task.done():
+            task.cancel()
+        else:
+            await query.answer("این دانلود قبلاً به پایان رسیده.", show_alert=True)
+        return
+
     if data.startswith("q:"):
         _, quality, short_id = data.split(":", 2)
         url = url_cache.get(short_id)
@@ -756,16 +953,29 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.message.reply_text("⚠️ لینک منقضی شده، دوباره بفرستید.")
             return
 
+        if not check_daily_limit(user.id):
+            await query.message.reply_text(
+                f"⛔ شما به سقف دانلود روزانه ({DAILY_LIMIT} مورد) رسیدید."
+            )
+            return
+
         await query.message.delete()
-        asyncio.create_task(download_and_send(query.message, user, url, quality))
+        job_id = uuid.uuid4().hex[:8]
+        status_msg = await context.bot.send_message(
+            chat_id=query.message.chat_id,
+            text="⏳ در حال دانلود... لطفاً شکیبا باشید.",
+            reply_markup=cancel_download_keyboard(job_id)
+        )
+        task = asyncio.create_task(
+            download_and_send(status_msg, user, url, quality, job_id, short_id)
+        )
+        active_downloads[job_id] = task
         return
 
 # ---------------------------------------------------------------------------
 # موتور اصلی دانلود
 # ---------------------------------------------------------------------------
-async def download_and_send(chat_msg, user, url, quality):
-    status_msg = await chat_msg.reply_text("⏳ در حال دانلود... لطفاً شکیبا باشید.")
-    job_id = uuid.uuid4().hex[:8]
+async def download_and_send(status_msg, user, url, quality, job_id, short_id):
     job_dir = os.path.join(DOWNLOAD_DIR, job_id)
     os.makedirs(job_dir, exist_ok=True)
 
@@ -795,9 +1005,26 @@ async def download_and_send(chat_msg, user, url, quality):
 
     loop = asyncio.get_running_loop()
 
-    # محدودیت دانلود همزمان: تا وقتی اسلات آزاد نشه صبر می‌کند
+    if download_semaphore.locked():
+        pos = queue_waiting_count() + 1
+        try:
+            await status_msg.edit_text(
+                f"⏳ در صف دانلود هستید... ({pos} نفر جلوتر از شما)",
+                reply_markup=cancel_download_keyboard(job_id)
+            )
+        except Exception:
+            pass
+
     async with download_semaphore:
         try:
+            try:
+                await status_msg.edit_text(
+                    "⏳ در حال دانلود... لطفاً شکیبا باشید.",
+                    reply_markup=cancel_download_keyboard(job_id)
+                )
+            except Exception:
+                pass
+
             def _extract():
                 with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                     return ydl.extract_info(url, download=True)
@@ -816,31 +1043,57 @@ async def download_and_send(chat_msg, user, url, quality):
             if not files:
                 raise RuntimeError("فایلی دانلود نشد.")
 
-            await status_msg.edit_text("📤 در حال ارسال فایل...")
+            try:
+                await status_msg.edit_text("📤 در حال ارسال فایل...", reply_markup=None)
+            except Exception:
+                pass
 
             for fname in files:
                 lower = fname.lower()
                 with open(fname, "rb") as f:
                     if lower.endswith(IMAGE_EXTS):
-                        await chat_msg.reply_photo(photo=f, caption="✅ دانلود شد!")
+                        await status_msg.reply_photo(photo=f, caption="✅ دانلود شد!")
                     elif lower.endswith(AUDIO_EXTS):
-                        await chat_msg.reply_audio(audio=f, caption="✅ فایل صوتی دانلود شد!")
+                        await status_msg.reply_audio(audio=f, caption="✅ فایل صوتی دانلود شد!")
                     else:
-                        await chat_msg.reply_video(video=f, caption="✅ ویدیو دانلود شد!")
+                        await status_msg.reply_video(video=f, caption="✅ ویدیو دانلود شد!")
+
+            # ارسال کپشن پست (اینستاگرام/یوتیوب/تیک‌تاک/...) به‌عنوان پیام جدا
+            caption_text = (info.get("description") or info.get("title") or "").strip()
+            if caption_text:
+                await status_msg.reply_text(f"📝 کپشن:\n\n{caption_text[:1000]}")
+
+            # پیام تشکر جداگانه
+            await status_msg.reply_text(CREDIT_MESSAGE)
+
+            # دکمه دانلود دوباره با کیفیت دیگر
+            await status_msg.reply_text(
+                "دوست داری با کیفیت دیگه‌ای هم دانلود کنی؟",
+                reply_markup=redo_keyboard(short_id)
+            )
 
             await status_msg.delete()
             await record_download(user.id, url=url, quality=quality)
+            increment_daily_count(user.id)
+
+        except asyncio.CancelledError:
+            try:
+                await status_msg.edit_text("❌ دانلود لغو شد.", reply_markup=None)
+            except Exception:
+                pass
+            raise
 
         except Exception as e:
             logger.exception("خطا در دانلود")
             await record_error()
             err_text = str(e)[:300]
             try:
-                await status_msg.edit_text(f"❌ خطا در دانلود:\n`{err_text}`", parse_mode=ParseMode.MARKDOWN)
+                await status_msg.edit_text(f"❌ خطا در دانلود:\n`{err_text}`", parse_mode=ParseMode.MARKDOWN, reply_markup=None)
             except Exception:
-                await chat_msg.reply_text(f"❌ خطا در دانلود:\n{err_text}")
+                await status_msg.reply_text(f"❌ خطا در دانلود:\n{err_text}")
 
         finally:
+            active_downloads.pop(job_id, None)
             for f in os.listdir(job_dir):
                 try:
                     os.remove(os.path.join(job_dir, f))
@@ -852,6 +1105,26 @@ async def download_and_send(chat_msg, user, url, quality):
                 pass
 
 # ---------------------------------------------------------------------------
+# پاکسازی خودکار پوشه‌های یتیم (اجرا به‌صورت دوره‌ای)
+# ---------------------------------------------------------------------------
+async def cleanup_job(context: ContextTypes.DEFAULT_TYPE):
+    now = time.time()
+    try:
+        for name in os.listdir(DOWNLOAD_DIR):
+            path = os.path.join(DOWNLOAD_DIR, name)
+            if not os.path.isdir(path):
+                continue
+            try:
+                mtime = os.path.getmtime(path)
+            except Exception:
+                continue
+            if now - mtime > ORPHAN_MAX_AGE_SECONDS:
+                shutil.rmtree(path, ignore_errors=True)
+                logger.info("پوشه یتیم پاکسازی شد: %s", path)
+    except Exception:
+        logger.exception("خطا در پاکسازی خودکار")
+
+# ---------------------------------------------------------------------------
 # اجرای اصلی
 # ---------------------------------------------------------------------------
 def main():
@@ -859,23 +1132,41 @@ def main():
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_cmd))
+    app.add_handler(CommandHandler("stats", stats_cmd))
 
     app.add_handler(CommandHandler("admin", admin_panel))
     app.add_handler(CommandHandler("broadcast", broadcast))
     app.add_handler(CommandHandler("ban", ban_user))
     app.add_handler(CommandHandler("unban", unban_user))
+    app.add_handler(CommandHandler("setvip", set_vip))
     app.add_handler(CommandHandler("off", toggle_maintenance))
     app.add_handler(CommandHandler("on", toggle_maintenance))
 
     app.add_handler(CallbackQueryHandler(button_handler))
 
-    # یک هندلر واحد برای متن: هم منو، هم لینک را مدیریت می‌کند
+    # یک هندلر برای متن: هم منو، هم لینک مستقیم را مدیریت می‌کند
     app.add_handler(
         MessageHandler(
             filters.TEXT & ~filters.COMMAND,
             menu_text_handler
         )
     )
+
+    # پیام‌های فوروارد/عکس/ویدیوی دارای کپشن که ممکن است لینک باشند
+    app.add_handler(
+        MessageHandler(
+            filters.CAPTION & ~filters.COMMAND,
+            handle_link
+        )
+    )
+
+    if app.job_queue is not None:
+        app.job_queue.run_repeating(cleanup_job, interval=1800, first=60)
+    else:
+        logger.warning(
+            "JobQueue فعال نیست؛ برای پاکسازی خودکار پکیج "
+            "'python-telegram-bot[job-queue]' را نصب کنید."
+        )
 
     print("ربات روشن شد...")
     app.run_polling()
