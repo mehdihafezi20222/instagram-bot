@@ -50,27 +50,19 @@ os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 STATS_FILE = "stats.json"
 stats_lock = asyncio.Lock()
 
-# کش‌ها
-url_cache = TTLCache(maxsize=1000, ttl=3600)          # short_id -> url
-quality_cache = TTLCache(maxsize=1000, ttl=3600)      # short_id -> [heights]
-preview_cache = TTLCache(maxsize=500, ttl=900)        # url -> preview info
-request_cache = TTLCache(maxsize=500, ttl=86400)      # cache_key -> cached result meta
+url_cache = TTLCache(maxsize=1000, ttl=3600)      # short_id -> url
+quality_cache = TTLCache(maxsize=1000, ttl=3600)  # short_id -> [heights]
+preview_cache = TTLCache(maxsize=500, ttl=900)    # url -> info
+request_cache = TTLCache(maxsize=500, ttl=86400)
 
-# محدودیت تعداد دانلود همزمان
 MAX_CONCURRENT_DOWNLOADS = int(os.environ.get("MAX_CONCURRENT_DOWNLOADS", "3"))
 download_semaphore = asyncio.Semaphore(MAX_CONCURRENT_DOWNLOADS)
 
-# دانلودهای در حال اجرا
-active_downloads = {}            # job_id -> asyncio.Task
-active_url_jobs = {}             # cache_key -> job_id
+active_downloads = {}     # job_id -> task
+active_url_jobs = {}      # cache_key -> job_id
 
-# سقف دانلود روزانه
 DEFAULT_DAILY_LIMIT = int(os.environ.get("DAILY_LIMIT", "10"))
-
-# پیام تشکر
 CREDIT_MESSAGE = "🙏 با تشکر از امپراطور ۲۹"
-
-# چند ثانیه یک پوشه‌ی دانلود یتیم روی دیسک باقی بماند قبل از پاکسازی خودکار
 ORPHAN_MAX_AGE_SECONDS = 3600
 
 SUPPORTED_DOMAINS = [
@@ -81,13 +73,7 @@ SUPPORTED_DOMAINS = [
 IMAGE_EXTS = (".jpg", ".jpeg", ".png", ".webp")
 AUDIO_EXTS = (".mp3", ".m4a", ".aac", ".ogg", ".wav", ".opus")
 VIDEO_EXTS = (".mp4", ".mkv", ".webm", ".mov", ".m4v", ".avi")
-
 URL_RE = re.compile(r'(https?://[^\s<>()]+|www\.[^\s<>()]+)', re.IGNORECASE)
-
-MENU_TEXTS = {
-    "📥 دانلود", "👤 پروفایل", "⚙️ تنظیمات", "🤝 تعامل",
-    "🔔 اعلان‌ها", "🚀 امکانات حرفه‌ای", "🛠 پنل ادمین", "💬 پشتیبانی",
-}
 
 SITE_LABELS = {
     "instagram.com": "Instagram",
@@ -100,8 +86,29 @@ SITE_LABELS = {
     "fb.watch": "Facebook",
 }
 
+DEFAULT_USER = {
+    "count": 0,
+    "username": "",
+    "notify": True,
+    "dark": False,
+    "language": "fa",
+    "last_action": "",
+    "history": [],
+    "vip": False,
+    "daily_count": 0,
+    "daily_date": "",
+    "joined_notified": False,
+    "total_size": 0,
+    "sites": {},
+    "last_seen": "",
+    "last_site": "",
+    "last_url": "",
+    "last_quality": "",
+    "last_title": "",
+}
+
 # ---------------------------------------------------------------------------
-# ذخیره‌سازی ساده JSON
+# ذخیره‌سازی
 # ---------------------------------------------------------------------------
 def load_stats():
     if os.path.exists(STATS_FILE):
@@ -141,29 +148,8 @@ def save_stats(data):
 
 stats = load_stats()
 
-DEFAULT_USER = {
-    "count": 0,
-    "username": "",
-    "notify": True,
-    "dark": False,
-    "language": "fa",
-    "last_action": "",
-    "history": [],
-    "vip": False,
-    "daily_count": 0,
-    "daily_date": "",
-    "joined_notified": False,
-    "total_size": 0,
-    "sites": {},
-    "last_seen": "",
-    "last_site": "",
-    "last_url": "",
-    "last_quality": "",
-    "last_title": "",
-}
-
 # ---------------------------------------------------------------------------
-# ابزارهای کمکى
+# ابزارها
 # ---------------------------------------------------------------------------
 def now_iso():
     return datetime.utcnow().isoformat(timespec="seconds")
@@ -297,7 +283,6 @@ def quality_to_format(quality: str) -> str:
 
     if q.isdigit():
         h = int(q)
-        # اول تلاش برای همان سقف کیفیت، بعد fallback به بهترین چیزی که شد
         return f"bv*[height<={h}]+ba/b[height<={h}]/best"
 
     if q == "1080":
@@ -427,7 +412,7 @@ def estimate_size(info: dict):
     return max(sizes) if sizes else None
 
 def get_available_heights(info: dict):
-    heights = sorted(
+    return sorted(
         {
             f.get("height")
             for f in (info.get("formats") or [])
@@ -435,7 +420,6 @@ def get_available_heights(info: dict):
         },
         reverse=True
     )
-    return heights
 
 def get_preview_text(info: dict, url: str) -> str:
     title = (info.get("title") or "").strip()
@@ -478,6 +462,7 @@ async def is_channel_member(bot, user_id: int) -> bool:
 async def fetch_preview_info(url: str):
     if url in preview_cache:
         return preview_cache[url]
+
     loop = asyncio.get_running_loop()
 
     def _probe():
@@ -548,9 +533,175 @@ def unregister_active_job(key: str, job_id: str):
     if active_url_jobs.get(key) == job_id:
         active_url_jobs.pop(key, None)
 
+def get_today_stats():
+    today = date.today().isoformat()
+    downloads_today = 0
+    active_users_today = 0
+    site_counts = {}
+
+    for uid, rec in stats.get("users", {}).items():
+        if rec.get("daily_date") == today and rec.get("daily_count", 0) > 0:
+            downloads_today += rec.get("daily_count", 0)
+            active_users_today += 1
+
+        sites = rec.get("sites", {})
+        if isinstance(sites, dict):
+            for site, count in sites.items():
+                site_counts[site] = site_counts.get(site, 0) + int(count or 0)
+
+    top_site = "-"
+    if site_counts:
+        top_site = max(site_counts.items(), key=lambda x: x[1])[0]
+
+    return {
+        "downloads_today": downloads_today,
+        "active_users_today": active_users_today,
+        "site_counts": site_counts,
+        "top_site": top_site,
+    }
+
+def find_user_record_by_id(user_id: int):
+    return stats.get("users", {}).get(str(user_id))
+
+def format_user_admin_card(user_id: int):
+    rec = find_user_record_by_id(user_id)
+    if not rec:
+        return f"❌ کاربر با آیدی `{user_id}` پیدا نشد."
+
+    total_size = human_size(rec.get("total_size", 0))
+    level = get_level_text(rec.get("count", 0))
+    fav_site = favorite_site(rec)
+    limit_text = "نامحدود" if rec.get("vip") else str(get_daily_limit())
+
+    return (
+        f"👤 اطلاعات کاربر\n\n"
+        f"ID: {user_id}\n"
+        f"یوزرنیم: @{rec.get('username') or 'ندارد'}\n"
+        f"دانلود: {rec.get('count', 0)}\n"
+        f"حجم کل: {total_size}\n"
+        f"سطح: {level}\n"
+        f"سایت محبوب: {fav_site}\n"
+        f"دانلود امروز: {rec.get('daily_count', 0)}/{limit_text}\n"
+        f"VIP: {'فعال ⭐' if rec.get('vip') else 'غیرفعال'}\n"
+        f"آخرین فعالیت: {rec.get('last_action', 'ندارد')}\n"
+        f"آخرین سایت: {rec.get('last_site', 'ندارد')}\n"
+        f"آخرین کیفیت: {quality_label(rec.get('last_quality', '')) if rec.get('last_quality') else 'ندارد'}"
+    )
+
 # ---------------------------------------------------------------------------
 # پیام‌های عمومی
 # ---------------------------------------------------------------------------
+def main_menu():
+    return ReplyKeyboardMarkup(
+        [
+            ["📥 دانلود", "👤 پروفایل"],
+            ["⚙️ تنظیمات", "🤝 تعامل"],
+            ["🔔 اعلان‌ها", "🚀 امکانات حرفه‌ای"],
+            ["🛠 پنل ادمین", "💬 پشتیبانی"],
+        ],
+        resize_keyboard=True
+    )
+
+def settings_keyboard():
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("🌐 تغییر زبان", callback_data="settings_lang"),
+            InlineKeyboardButton("🌙 حالت شب", callback_data="settings_dark"),
+        ],
+        [
+            InlineKeyboardButton("🔔 اعلان‌ها", callback_data="settings_notify"),
+            InlineKeyboardButton("♻️ بازنشانی تنظیمات", callback_data="settings_reset"),
+        ],
+        [InlineKeyboardButton("🔙 بازگشت", callback_data="back_main")]
+    ])
+
+def interaction_keyboard():
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("⭐ امتیاز دادن", callback_data="rate"),
+            InlineKeyboardButton("💬 ارسال بازخورد", callback_data="feedback"),
+        ],
+        [
+            InlineKeyboardButton("📢 دعوت دوستان", callback_data="invite"),
+            InlineKeyboardButton("📨 ارسال پیام", callback_data="sendmsg"),
+        ],
+        [InlineKeyboardButton("🔙 بازگشت", callback_data="back_main")]
+    ])
+
+def pro_keyboard():
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("📊 آمار من", callback_data="my_stats"),
+            InlineKeyboardButton("🕘 تاریخچه دانلود", callback_data="history"),
+        ],
+        [
+            InlineKeyboardButton("🔁 آخرین دانلود", callback_data="last_download"),
+            InlineKeyboardButton("⭐ VIP", callback_data="vip"),
+        ],
+        [InlineKeyboardButton("🎁 کد دعوت", callback_data="referral")],
+        [InlineKeyboardButton("🔙 بازگشت", callback_data="back_main")]
+    ])
+
+def admin_keyboard():
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("📊 آمار ربات", callback_data="admin_stats"),
+            InlineKeyboardButton("📅 آمار امروز", callback_data="admin_today"),
+        ],
+        [
+            InlineKeyboardButton("👥 کاربران", callback_data="admin_users"),
+            InlineKeyboardButton("🔎 جستجوی کاربر", callback_data="admin_find_user"),
+        ],
+        [
+            InlineKeyboardButton("📢 ارسال همگانی", callback_data="admin_broadcast"),
+            InlineKeyboardButton("🚫 مدیریت کاربران", callback_data="admin_users_manage"),
+        ],
+        [
+            InlineKeyboardButton("🔧 تنظیمات ربات", callback_data="admin_settings"),
+            InlineKeyboardButton("🛠 تغییر حالت تعمیرات", callback_data="admin_maintenance"),
+        ],
+        [InlineKeyboardButton("❌ بستن پنل", callback_data="admin_close")]
+    ])
+
+def quality_keyboard(short_id: str, heights=None):
+    buttons = []
+    heights = heights or []
+    unique_heights = []
+    seen = set()
+
+    for h in heights:
+        if h and str(h).isdigit():
+            h = int(h)
+            if h not in seen:
+                seen.add(h)
+                unique_heights.append(h)
+
+    unique_heights.sort(reverse=True)
+
+    if unique_heights:
+        for h in unique_heights:
+            buttons.append([InlineKeyboardButton(f"📺 {h}p", callback_data=f"q:{h}:{short_id}")])
+        buttons.append([InlineKeyboardButton("🎬 بهترین کیفیت", callback_data=f"q:best:{short_id}")])
+    else:
+        buttons.append([InlineKeyboardButton("🎬 بهترین کیفیت", callback_data=f"q:best:{short_id}")])
+
+    buttons.append([InlineKeyboardButton("🎧 فقط صدا (MP3)", callback_data=f"q:audio:{short_id}")])
+    buttons.append([InlineKeyboardButton("❌ انصراف", callback_data="cancel_select")])
+    return InlineKeyboardMarkup(buttons)
+
+def cancel_download_keyboard(job_id: str):
+    return InlineKeyboardMarkup([[InlineKeyboardButton("❌ لغو دانلود", callback_data=f"cancel_dl:{job_id}")]])
+
+def redo_keyboard(short_id: str):
+    return InlineKeyboardMarkup([[InlineKeyboardButton("🔁 دانلود دوباره با کیفیت دیگه", callback_data=f"redo:{short_id}")]])
+
+def force_join_keyboard():
+    ch_clean = CHANNEL_USERNAME.replace("@", "")
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("📢 عضویت در کانال", url=f"https://t.me/{ch_clean}")],
+        [InlineKeyboardButton("✅ بررسی عضویت", callback_data="check_join")]
+    ])
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     await record_user(user.id, user.username)
@@ -582,9 +733,6 @@ async def stats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     await update.message.reply_text(format_stats(user.id, user))
 
-# ---------------------------------------------------------------------------
-# پنل ادمین
-# ---------------------------------------------------------------------------
 async def admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     if user_id not in ADMIN_IDS:
@@ -596,6 +744,8 @@ async def admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     active_running = len(active_downloads)
     cache_count = len(stats.get("telegram_cache", {}))
+    today = get_today_stats()
+
     text = (
         "🛠 *پنل مدیریت ربات*\n\n"
         f"👥 تعداد کاربران: {len(stats['users'])}\n"
@@ -606,7 +756,10 @@ async def admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"📢 ارسال همگانی انجام‌شده: {stats.get('broadcast_count', 0)}\n"
         f"⏳ دانلودهای فعال: {active_running}\n"
         f"🧠 کش فایل تلگرام: {cache_count}\n"
-        f"📆 سقف دانلود روزانه: {get_daily_limit()}"
+        f"📆 سقف دانلود روزانه: {get_daily_limit()}\n\n"
+        f"📅 دانلودهای امروز: {today['downloads_today']}\n"
+        f"👤 کاربران فعال امروز: {today['active_users_today']}\n"
+        f"🔥 سایت محبوب امروز: {today['top_site']}"
     )
     await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN, reply_markup=admin_keyboard())
 
@@ -662,6 +815,16 @@ async def broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
         report += f"\n\n🚫 آیدی‌های ناموفق:\n{shown}{more}"
 
     await status_msg.edit_text(report, parse_mode=ParseMode.MARKDOWN)
+
+async def user_info_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id not in ADMIN_IDS:
+        return
+    if not context.args or not context.args[0].isdigit():
+        await update.message.reply_text("استفاده: `/user USER_ID`", parse_mode=ParseMode.MARKDOWN)
+        return
+    uid = int(context.args[0])
+    text = format_user_admin_card(uid)
+    await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
 
 async def ban_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id not in ADMIN_IDS:
@@ -759,137 +922,6 @@ async def ping_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await msg.edit_text(f"🏓 Pong\n⏱ پاسخ: {elapsed}ms")
 
 # ---------------------------------------------------------------------------
-# منوها
-# ---------------------------------------------------------------------------
-def main_menu():
-    return ReplyKeyboardMarkup(
-        [
-            ["📥 دانلود", "👤 پروفایل"],
-            ["⚙️ تنظیمات", "🤝 تعامل"],
-            ["🔔 اعلان‌ها", "🚀 امکانات حرفه‌ای"],
-            ["🛠 پنل ادمین", "💬 پشتیبانی"],
-        ],
-        resize_keyboard=True
-    )
-
-def settings_keyboard():
-    return InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton("🌐 تغییر زبان", callback_data="settings_lang"),
-            InlineKeyboardButton("🌙 حالت شب", callback_data="settings_dark"),
-        ],
-        [
-            InlineKeyboardButton("🔔 اعلان‌ها", callback_data="settings_notify"),
-            InlineKeyboardButton("♻️ بازنشانی تنظیمات", callback_data="settings_reset"),
-        ],
-        [
-            InlineKeyboardButton("🔙 بازگشت", callback_data="back_main"),
-        ]
-    ])
-
-def interaction_keyboard():
-    return InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton("⭐ امتیاز دادن", callback_data="rate"),
-            InlineKeyboardButton("💬 ارسال بازخورد", callback_data="feedback"),
-        ],
-        [
-            InlineKeyboardButton("📢 دعوت دوستان", callback_data="invite"),
-            InlineKeyboardButton("📨 ارسال پیام", callback_data="sendmsg"),
-        ],
-        [
-            InlineKeyboardButton("🔙 بازگشت", callback_data="back_main"),
-        ]
-    ])
-
-def pro_keyboard():
-    return InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton("📊 آمار من", callback_data="my_stats"),
-            InlineKeyboardButton("🕘 تاریخچه دانلود", callback_data="history"),
-        ],
-        [
-            InlineKeyboardButton("🔁 آخرین دانلود", callback_data="last_download"),
-            InlineKeyboardButton("⭐ VIP", callback_data="vip"),
-        ],
-        [
-            InlineKeyboardButton("🎁 کد دعوت", callback_data="referral"),
-        ],
-        [
-            InlineKeyboardButton("🔙 بازگشت", callback_data="back_main"),
-        ]
-    ])
-
-def admin_keyboard():
-    return InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton("📊 آمار ربات", callback_data="admin_stats"),
-            InlineKeyboardButton("👥 کاربران", callback_data="admin_users"),
-        ],
-        [
-            InlineKeyboardButton("📢 ارسال همگانی", callback_data="admin_broadcast"),
-            InlineKeyboardButton("🚫 مدیریت کاربران", callback_data="admin_users_manage"),
-        ],
-        [
-            InlineKeyboardButton("🔧 تنظیمات ربات", callback_data="admin_settings"),
-            InlineKeyboardButton("🛠 تغییر حالت تعمیرات", callback_data="admin_maintenance"),
-        ],
-        [
-            InlineKeyboardButton("❌ بستن پنل", callback_data="admin_close"),
-        ]
-    ])
-
-def quality_keyboard(short_id: str, heights=None):
-    buttons = []
-    heights = heights or []
-    unique_heights = []
-    seen = set()
-
-    for h in heights:
-        if h and str(h).isdigit():
-            h = int(h)
-            if h not in seen:
-                seen.add(h)
-                unique_heights.append(h)
-
-    unique_heights.sort(reverse=True)
-
-    if unique_heights:
-        # اول فقط کیفیت‌های واقعی موجود
-        for h in unique_heights:
-            buttons.append([
-                InlineKeyboardButton(f"📺 {h}p", callback_data=f"q:{h}:{short_id}")
-            ])
-        buttons.append([
-            InlineKeyboardButton("🎬 بهترین کیفیت", callback_data=f"q:best:{short_id}")
-        ])
-    else:
-        buttons.extend([
-            [InlineKeyboardButton("🎬 بهترین کیفیت", callback_data=f"q:best:{short_id}")],
-        ])
-
-    buttons.append([InlineKeyboardButton("🎧 فقط صدا (MP3)", callback_data=f"q:audio:{short_id}")])
-    buttons.append([InlineKeyboardButton("❌ انصراف", callback_data="cancel_select")])
-    return InlineKeyboardMarkup(buttons)
-
-def cancel_download_keyboard(job_id: str):
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("❌ لغو دانلود", callback_data=f"cancel_dl:{job_id}")]
-    ])
-
-def redo_keyboard(short_id: str):
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("🔁 دانلود دوباره با کیفیت دیگه", callback_data=f"redo:{short_id}")]
-    ])
-
-def force_join_keyboard():
-    ch_clean = CHANNEL_USERNAME.replace("@", "")
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("📢 عضویت در کانال", url=f"https://t.me/{ch_clean}")],
-        [InlineKeyboardButton("✅ بررسی عضویت", callback_data="check_join")]
-    ])
-
-# ---------------------------------------------------------------------------
 # پردازش لینک
 # ---------------------------------------------------------------------------
 async def handle_links(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -976,319 +1008,7 @@ async def process_single_url(update: Update, context: ContextTypes.DEFAULT_TYPE,
         )
 
 # ---------------------------------------------------------------------------
-# هندلر دکمه‌ها
-# ---------------------------------------------------------------------------
-async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    data = query.data
-    user = query.from_user
-
-    if data == "back_main":
-        try:
-            await query.message.edit_text("🏠 منوی اصلی", reply_markup=None)
-        except Exception:
-            pass
-        await query.message.reply_text("یکی از گزینه‌ها را انتخاب کن:", reply_markup=main_menu())
-        return
-
-    if data == "check_join":
-        if await is_channel_member(context.bot, user.id):
-            u = get_user_record(user.id)
-            if not u.get("joined_notified"):
-                u["joined_notified"] = True
-                save_stats(stats)
-                await query.message.edit_text(
-                    "✅ عضویت شما تایید شد. ممنون که به ما پیوستی 🙌\n"
-                    "حالا می‌تونی لینک بفرستی."
-                )
-            else:
-                await query.message.edit_text("✅ عضویت شما تایید شد. حالا می‌تونی لینک بفرستی.")
-        else:
-            await query.answer("⚠️ هنوز عضو کانال نشده‌اید.", show_alert=True)
-        return
-
-    if data.startswith("settings_"):
-        u = get_user_record(user.id)
-        if data == "settings_lang":
-            current = u.get("language", "fa")
-            new_lang = "en" if current == "fa" else "fa"
-            u["language"] = new_lang
-            save_stats(stats)
-            await query.message.edit_text(f"🌐 زبان تغییر کرد: {new_lang}")
-            return
-
-        if data == "settings_dark":
-            u["dark"] = not u.get("dark", False)
-            save_stats(stats)
-            await query.message.edit_text(
-                f"🌙 حالت شب: {'فعال ✅' if u['dark'] else 'خاموش ❌'}"
-            )
-            return
-
-        if data == "settings_notify":
-            u["notify"] = not u.get("notify", True)
-            save_stats(stats)
-            await query.message.edit_text(
-                f"🔔 اعلان‌ها: {'فعال ✅' if u['notify'] else 'خاموش ❌'}"
-            )
-            return
-
-        if data == "settings_reset":
-            u["notify"] = True
-            u["dark"] = False
-            u["language"] = "fa"
-            save_stats(stats)
-            await query.message.edit_text("♻️ تنظیمات به حالت پیش‌فرض برگشت.")
-            return
-
-    if data == "rate":
-        await query.message.edit_text(
-            "⭐ از ربات راضی هستی؟\n\n"
-            "فعلاً بخش امتیازدهی نمایشی است و بعداً می‌شود به دیتابیس وصلش کرد."
-        )
-        return
-
-    if data == "feedback":
-        await query.message.edit_text(
-            "💬 بازخوردت را همینجا بفرست.\n"
-            "بعداً می‌شود این بخش را به فرم یا ذخیره‌سازی وصل کرد."
-        )
-        return
-
-    if data == "invite":
-        await query.message.edit_text(
-            f"📢 لینک دعوت شما:\n\n"
-            f"`https://t.me/{context.bot.username}?start={user.id}`",
-            parse_mode=ParseMode.MARKDOWN
-        )
-        return
-
-    if data == "sendmsg":
-        await query.message.edit_text(
-            "📨 این بخش فعلاً نمایشی است.\n"
-            "بعداً می‌شود آن را به سیستم پیام‌دهی داخلی وصل کرد."
-        )
-        return
-
-    if data == "notify_on":
-        u = get_user_record(user.id)
-        u["notify"] = True
-        save_stats(stats)
-        await query.message.edit_text("🔔 اعلان‌ها فعال شد ✅")
-        return
-
-    if data == "notify_off":
-        u = get_user_record(user.id)
-        u["notify"] = False
-        save_stats(stats)
-        await query.message.edit_text("🔕 اعلان‌ها خاموش شد ❌")
-        return
-
-    if data == "my_stats":
-        await query.message.edit_text(format_stats(user.id, user))
-        return
-
-    if data == "history":
-        u = get_user_record(user.id)
-        history = u.get("history", [])
-        if not history:
-            await query.message.edit_text("🕘 هنوز تاریخچه‌ای ثبت نشده است.")
-            return
-        lines = ["🕘 تاریخچه دانلود شما:\n"]
-        for i, item in enumerate(history[:10], start=1):
-            q = item.get("quality", "-")
-            url = item.get("url", "-")
-            title = item.get("title", "")
-            lines.append(f"{i}. کیفیت: {q}\n{title}\n{url}\n")
-        await query.message.edit_text("\n".join(lines))
-        return
-
-    if data == "last_download":
-        u = get_user_record(user.id)
-        if not u.get("last_url"):
-            await query.message.edit_text("🕘 هنوز دانلودی ثبت نشده است.")
-            return
-        short_id = uuid.uuid4().hex[:8]
-        url_cache[short_id] = u["last_url"]
-        last_quality = str(u.get("last_quality") or "best")
-        if last_quality.isdigit():
-            quality_cache[short_id] = [int(last_quality)]
-        else:
-            quality_cache[short_id] = []
-        await query.message.edit_text(
-            f"🔁 آخرین دانلود شما آماده است.\nکیفیت قبلی: {quality_label(last_quality)}",
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("🔁 با همان کیفیت", callback_data=f"q:{last_quality}:{short_id}")],
-                [InlineKeyboardButton("🎚 انتخاب کیفیت دیگر", callback_data=f"redo:{short_id}")]
-            ])
-        )
-        return
-
-    if data == "vip":
-        u = get_user_record(user.id)
-        status = "فعال ✅" if u.get("vip") else "غیرفعال ❌"
-        await query.message.edit_text(
-            f"⭐ بخش VIP\n\n"
-            f"وضعیت فعلی شما: {status}\n\n"
-            "کاربران VIP از سقف دانلود روزانه معاف هستند.\n"
-            "برای فعال‌سازی با پشتیبانی در ارتباط باشید."
-        )
-        return
-
-    if data == "referral":
-        await query.message.edit_text(
-            f"🎁 کد دعوت شما:\n\n`{user.id}`\n\n"
-            f"لینک دعوت:\n`https://t.me/{context.bot.username}?start={user.id}`",
-            parse_mode=ParseMode.MARKDOWN
-        )
-        return
-
-    if data.startswith("admin_"):
-        if user.id not in ADMIN_IDS:
-            await query.answer("⛔ دسترسی ندارید", show_alert=True)
-            return
-
-        if data == "admin_stats":
-            await query.message.edit_text(
-                "📊 آمار ربات\n\n"
-                f"👥 کاربران: {len(stats['users'])}\n"
-                f"📥 دانلود موفق: {stats['total_downloads']}\n"
-                f"❌ خطاها: {stats['total_errors']}\n"
-                f"🚫 بن شده: {len(stats['banned'])}\n"
-                f"🛠 حالت تعمیرات: {'فعال' if stats.get('maintenance') else 'غیرفعال'}\n"
-                f"📢 ارسال همگانی: {stats.get('broadcast_count', 0)}\n"
-                f"⏳ دانلودهای فعال: {len(active_downloads)}\n"
-                f"🧠 کش فایل تلگرام: {len(stats.get('telegram_cache', {}))}\n"
-                f"📆 سقف دانلود روزانه: {get_daily_limit()}",
-                reply_markup=admin_keyboard()
-            )
-            return
-
-        if data == "admin_users":
-            await query.message.edit_text(
-                f"👥 تعداد کاربران ثبت‌شده: {len(stats['users'])}",
-                reply_markup=admin_keyboard()
-            )
-            return
-
-        if data == "admin_users_manage":
-            await query.message.edit_text(
-                "🚫 مدیریت کاربران\n\n"
-                "دستورها:\n"
-                "/ban USER_ID\n"
-                "/unban USER_ID\n"
-                "/setvip USER_ID\n"
-                "/limit NUMBER\n"
-                "/users [N]\n"
-                "/clearcache\n"
-                "/ping",
-                reply_markup=admin_keyboard()
-            )
-            return
-
-        if data == "admin_settings":
-            await query.message.edit_text(
-                "🔧 تنظیمات ربات\n\n"
-                "فعلاً تنظیمات اصلی همین‌ها هستند:\n"
-                "• کانال اجباری\n"
-                "• حالت تعمیرات\n"
-                "• مدیریت کاربران\n"
-                "• ارسال همگانی\n"
-                f"• سقف دانلود روزانه: {get_daily_limit()}",
-                reply_markup=admin_keyboard()
-            )
-            return
-
-        if data == "admin_maintenance":
-            stats["maintenance"] = not stats.get("maintenance", False)
-            save_stats(stats)
-            status = "فعال 🛠" if stats["maintenance"] else "غیرفعال 🟢"
-            await query.message.edit_text(
-                f"حالت تعمیرات: {status}",
-                reply_markup=admin_keyboard()
-            )
-            return
-
-        if data == "admin_broadcast":
-            await query.message.edit_text(
-                "📢 ارسال همگانی\n\n"
-                "از دستور زیر استفاده کن:\n\n"
-                "`/broadcast متن پیام`\n\n"
-                "یا روی یک پیام ریپلای کن و `/broadcast` بزن.",
-                parse_mode=ParseMode.MARKDOWN,
-                reply_markup=admin_keyboard()
-            )
-            return
-
-        if data == "admin_close":
-            await query.message.delete()
-            return
-
-    if data == "cancel_select":
-        await query.message.delete()
-        return
-
-    if data.startswith("redo:"):
-        short_id = data.split(":", 1)[1]
-        url = url_cache.get(short_id)
-        if not url:
-            await query.message.edit_text("⚠️ لینک منقضی شده، لینک رو دوباره بفرست.")
-            return
-        heights = quality_cache.get(short_id, [])
-        await query.message.edit_text("🎚 کیفیت مورد نظرت را انتخاب کن:", reply_markup=quality_keyboard(short_id, heights))
-        return
-
-    if data.startswith("cancel_dl:"):
-        job_id = data.split(":", 1)[1]
-        task = active_downloads.get(job_id)
-        if task and not task.done():
-            task.cancel()
-        else:
-            await query.answer("این دانلود قبلاً به پایان رسیده.", show_alert=True)
-        return
-
-    if data.startswith("q:"):
-        _, quality, short_id = data.split(":", 2)
-        url = url_cache.get(short_id)
-        if not url:
-            await query.message.reply_text("⚠️ لینک منقضی شده، دوباره بفرستید.")
-            return
-
-        if not check_daily_limit(user.id):
-            await query.message.reply_text(
-                f"⛔ شما به سقف دانلود روزانه ({get_daily_limit()} مورد) رسیدید."
-            )
-            return
-
-        ckey = cache_key(url, quality)
-        if ckey in active_url_jobs:
-            await query.answer("⚠️ این لینک الان در حال پردازش است.", show_alert=True)
-            return
-
-        job_id = uuid.uuid4().hex[:8]
-        if not register_active_job(ckey, job_id):
-            await query.answer("⚠️ این لینک الان در حال پردازش است.", show_alert=True)
-            return
-
-        try:
-            await query.message.delete()
-        except Exception:
-            pass
-
-        status_msg = await context.bot.send_message(
-            chat_id=query.message.chat_id,
-            text="⏳ در حال آماده‌سازی دانلود... لطفاً شکیبا باشید.",
-            reply_markup=cancel_download_keyboard(job_id)
-        )
-        task = asyncio.create_task(
-            download_and_send(status_msg, user, url, quality, job_id, short_id)
-        )
-        active_downloads[job_id] = task
-        return
-
-# ---------------------------------------------------------------------------
-# موتور اصلی دانلود
+# دانلود
 # ---------------------------------------------------------------------------
 async def download_and_send(status_msg, user, url, quality, job_id, short_id):
     job_dir = os.path.join(DOWNLOAD_DIR, job_id)
@@ -1312,10 +1032,7 @@ async def download_and_send(status_msg, user, url, quality, job_id, short_id):
                 caption_used = True
 
             await status_msg.reply_text(CREDIT_MESSAGE)
-            await status_msg.reply_text(
-                "دوست داری با کیفیت دیگه‌ای هم دانلود کنی؟",
-                reply_markup=redo_keyboard(short_id)
-            )
+            await status_msg.reply_text("دوست داری با کیفیت دیگه‌ای هم دانلود کنی؟", reply_markup=redo_keyboard(short_id))
             await record_download(
                 user.id,
                 url=url,
@@ -1458,12 +1175,7 @@ async def _download_and_send_real(status_msg, user, url, quality, job_id, short_
                     await status_msg.reply_text(f"📝 کپشن:\n\n{caption_text[:1000]}")
 
                 await status_msg.reply_text(CREDIT_MESSAGE)
-
-                await status_msg.reply_text(
-                    "دوست داری با کیفیت دیگه‌ای هم دانلود کنی؟",
-                    reply_markup=redo_keyboard(short_id)
-                )
-
+                await status_msg.reply_text("دوست داری با کیفیت دیگه‌ای هم دانلود کنی؟", reply_markup=redo_keyboard(short_id))
                 await status_msg.delete()
 
                 if sent_items:
@@ -1561,7 +1273,7 @@ async def record_error():
         save_stats(stats)
 
 # ---------------------------------------------------------------------------
-# پاکسازی خودکار
+# پاکسازی
 # ---------------------------------------------------------------------------
 async def cleanup_job(context: ContextTypes.DEFAULT_TYPE):
     now = time.time()
@@ -1581,6 +1293,328 @@ async def cleanup_job(context: ContextTypes.DEFAULT_TYPE):
         logger.exception("خطا در پاکسازی خودکار")
 
 # ---------------------------------------------------------------------------
+# دکمه‌ها
+# ---------------------------------------------------------------------------
+async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    data = query.data
+    user = query.from_user
+
+    if data == "back_main":
+        try:
+            await query.message.edit_text("🏠 منوی اصلی", reply_markup=None)
+        except Exception:
+            pass
+        await query.message.reply_text("یکی از گزینه‌ها را انتخاب کن:", reply_markup=main_menu())
+        return
+
+    if data == "check_join":
+        if await is_channel_member(context.bot, user.id):
+            u = get_user_record(user.id)
+            if not u.get("joined_notified"):
+                u["joined_notified"] = True
+                save_stats(stats)
+                await query.message.edit_text(
+                    "✅ عضویت شما تایید شد. ممنون که به ما پیوستی 🙌\n"
+                    "حالا می‌تونی لینک بفرستی."
+                )
+            else:
+                await query.message.edit_text("✅ عضویت شما تایید شد. حالا می‌تونی لینک بفرستی.")
+        else:
+            await query.answer("⚠️ هنوز عضو کانال نشده‌اید.", show_alert=True)
+        return
+
+    if data.startswith("settings_"):
+        u = get_user_record(user.id)
+        if data == "settings_lang":
+            current = u.get("language", "fa")
+            new_lang = "en" if current == "fa" else "fa"
+            u["language"] = new_lang
+            save_stats(stats)
+            await query.message.edit_text(f"🌐 زبان تغییر کرد: {new_lang}")
+            return
+
+        if data == "settings_dark":
+            u["dark"] = not u.get("dark", False)
+            save_stats(stats)
+            await query.message.edit_text(f"🌙 حالت شب: {'فعال ✅' if u['dark'] else 'خاموش ❌'}")
+            return
+
+        if data == "settings_notify":
+            u["notify"] = not u.get("notify", True)
+            save_stats(stats)
+            await query.message.edit_text(f"🔔 اعلان‌ها: {'فعال ✅' if u['notify'] else 'خاموش ❌'}")
+            return
+
+        if data == "settings_reset":
+            u["notify"] = True
+            u["dark"] = False
+            u["language"] = "fa"
+            save_stats(stats)
+            await query.message.edit_text("♻️ تنظیمات به حالت پیش‌فرض برگشت.")
+            return
+
+    if data == "rate":
+        await query.message.edit_text(
+            "⭐ از ربات راضی هستی؟\n\n"
+            "فعلاً بخش امتیازدهی نمایشی است و بعداً می‌شود به دیتابیس وصلش کرد."
+        )
+        return
+
+    if data == "feedback":
+        await query.message.edit_text(
+            "💬 بازخوردت را همینجا بفرست.\n"
+            "بعداً می‌شود این بخش را به فرم یا ذخیره‌سازی وصل کرد."
+        )
+        return
+
+    if data == "invite":
+        await query.message.edit_text(
+            f"📢 لینک دعوت شما:\n\n"
+            f"`https://t.me/{context.bot.username}?start={user.id}`",
+            parse_mode=ParseMode.MARKDOWN
+        )
+        return
+
+    if data == "sendmsg":
+        await query.message.edit_text(
+            "📨 این بخش فعلاً نمایشی است.\n"
+            "بعداً می‌شود آن را به سیستم پیام‌دهی داخلی وصل کرد."
+        )
+        return
+
+    if data == "notify_on":
+        u = get_user_record(user.id)
+        u["notify"] = True
+        save_stats(stats)
+        await query.message.edit_text("🔔 اعلان‌ها فعال شد ✅")
+        return
+
+    if data == "notify_off":
+        u = get_user_record(user.id)
+        u["notify"] = False
+        save_stats(stats)
+        await query.message.edit_text("🔕 اعلان‌ها خاموش شد ❌")
+        return
+
+    if data == "my_stats":
+        await query.message.edit_text(format_stats(user.id, user))
+        return
+
+    if data == "history":
+        u = get_user_record(user.id)
+        history = u.get("history", [])
+        if not history:
+            await query.message.edit_text("🕘 هنوز تاریخچه‌ای ثبت نشده است.")
+            return
+        lines = ["🕘 تاریخچه دانلود شما:\n"]
+        for i, item in enumerate(history[:10], start=1):
+            q = item.get("quality", "-")
+            url = item.get("url", "-")
+            title = item.get("title", "")
+            lines.append(f"{i}. کیفیت: {q}\n{title}\n{url}\n")
+        await query.message.edit_text("\n".join(lines))
+        return
+
+    if data == "last_download":
+        u = get_user_record(user.id)
+        if not u.get("last_url"):
+            await query.message.edit_text("🕘 هنوز دانلودی ثبت نشده است.")
+            return
+        short_id = uuid.uuid4().hex[:8]
+        url_cache[short_id] = u["last_url"]
+        last_quality = str(u.get("last_quality") or "best")
+        if last_quality.isdigit():
+            quality_cache[short_id] = [int(last_quality)]
+        else:
+            quality_cache[short_id] = []
+        await query.message.edit_text(
+            f"🔁 آخرین دانلود شما آماده است.\nکیفیت قبلی: {quality_label(last_quality)}",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("🔁 با همان کیفیت", callback_data=f"q:{last_quality}:{short_id}")],
+                [InlineKeyboardButton("🎚 انتخاب کیفیت دیگر", callback_data=f"redo:{short_id}")]
+            ])
+        )
+        return
+
+    if data == "vip":
+        u = get_user_record(user.id)
+        status = "فعال ✅" if u.get("vip") else "غیرفعال ❌"
+        await query.message.edit_text(
+            f"⭐ بخش VIP\n\n"
+            f"وضعیت فعلی شما: {status}\n\n"
+            "کاربران VIP از سقف دانلود روزانه معاف هستند.\n"
+            "برای فعال‌سازی با پشتیبانی در ارتباط باشید."
+        )
+        return
+
+    if data == "referral":
+        await query.message.edit_text(
+            f"🎁 کد دعوت شما:\n\n`{user.id}`\n\n"
+            f"لینک دعوت:\n`https://t.me/{context.bot.username}?start={user.id}`",
+            parse_mode=ParseMode.MARKDOWN
+        )
+        return
+
+    if data.startswith("admin_"):
+        if user.id not in ADMIN_IDS:
+            await query.answer("⛔ دسترسی ندارید", show_alert=True)
+            return
+
+        if data == "admin_stats":
+            await query.message.edit_text(
+                "📊 آمار ربات\n\n"
+                f"👥 کاربران: {len(stats['users'])}\n"
+                f"📥 دانلود موفق: {stats['total_downloads']}\n"
+                f"❌ خطاها: {stats['total_errors']}\n"
+                f"🚫 بن شده: {len(stats['banned'])}\n"
+                f"🛠 حالت تعمیرات: {'فعال' if stats.get('maintenance') else 'غیرفعال'}\n"
+                f"📢 ارسال همگانی: {stats.get('broadcast_count', 0)}\n"
+                f"⏳ دانلودهای فعال: {len(active_downloads)}\n"
+                f"🧠 کش فایل تلگرام: {len(stats.get('telegram_cache', {}))}\n"
+                f"📆 سقف دانلود روزانه: {get_daily_limit()}",
+                reply_markup=admin_keyboard()
+            )
+            return
+
+        if data == "admin_today":
+            today = get_today_stats()
+            await query.message.edit_text(
+                "📅 آمار امروز\n\n"
+                f"📥 دانلودهای امروز: {today['downloads_today']}\n"
+                f"👤 کاربران فعال امروز: {today['active_users_today']}\n"
+                f"🔥 سایت محبوب امروز: {today['top_site']}",
+                reply_markup=admin_keyboard()
+            )
+            return
+
+        if data == "admin_users":
+            await query.message.edit_text(
+                f"👥 تعداد کاربران ثبت‌شده: {len(stats['users'])}",
+                reply_markup=admin_keyboard()
+            )
+            return
+
+        if data == "admin_find_user":
+            await query.message.edit_text(
+                "🔎 برای دیدن اطلاعات کاربر از دستور زیر استفاده کن:\n\n"
+                "`/user USER_ID`",
+                parse_mode=ParseMode.MARKDOWN,
+                reply_markup=admin_keyboard()
+            )
+            return
+
+        if data == "admin_users_manage":
+            await query.message.edit_text(
+                "🚫 مدیریت کاربران\n\n"
+                "دستورها:\n"
+                "/ban USER_ID\n"
+                "/unban USER_ID\n"
+                "/setvip USER_ID\n"
+                "/limit NUMBER\n"
+                "/users [N]\n"
+                "/user USER_ID\n"
+                "/clearcache\n"
+                "/ping",
+                reply_markup=admin_keyboard()
+            )
+            return
+
+        if data == "admin_settings":
+            await query.message.edit_text(
+                "🔧 تنظیمات ربات\n\n"
+                "فعلاً تنظیمات اصلی همین‌ها هستند:\n"
+                "• کانال اجباری\n"
+                "• حالت تعمیرات\n"
+                "• مدیریت کاربران\n"
+                "• ارسال همگانی\n"
+                f"• سقف دانلود روزانه: {get_daily_limit()}",
+                reply_markup=admin_keyboard()
+            )
+            return
+
+        if data == "admin_maintenance":
+            stats["maintenance"] = not stats.get("maintenance", False)
+            save_stats(stats)
+            status = "فعال 🛠" if stats["maintenance"] else "غیرفعال 🟢"
+            await query.message.edit_text(f"حالت تعمیرات: {status}", reply_markup=admin_keyboard())
+            return
+
+        if data == "admin_broadcast":
+            await query.message.edit_text(
+                "📢 ارسال همگانی\n\n"
+                "از دستور زیر استفاده کن:\n\n"
+                "`/broadcast متن پیام`\n\n"
+                "یا روی یک پیام ریپلای کن و `/broadcast` بزن.",
+                parse_mode=ParseMode.MARKDOWN,
+                reply_markup=admin_keyboard()
+            )
+            return
+
+        if data == "admin_close":
+            await query.message.delete()
+            return
+
+    if data == "cancel_select":
+        await query.message.delete()
+        return
+
+    if data.startswith("redo:"):
+        short_id = data.split(":", 1)[1]
+        url = url_cache.get(short_id)
+        if not url:
+            await query.message.edit_text("⚠️ لینک منقضی شده، لینک رو دوباره بفرست.")
+            return
+        heights = quality_cache.get(short_id, [])
+        await query.message.edit_text("🎚 کیفیت مورد نظرت را انتخاب کن:", reply_markup=quality_keyboard(short_id, heights))
+        return
+
+    if data.startswith("cancel_dl:"):
+        job_id = data.split(":", 1)[1]
+        task = active_downloads.get(job_id)
+        if task and not task.done():
+            task.cancel()
+        else:
+            await query.answer("این دانلود قبلاً به پایان رسیده.", show_alert=True)
+        return
+
+    if data.startswith("q:"):
+        _, quality, short_id = data.split(":", 2)
+        url = url_cache.get(short_id)
+        if not url:
+            await query.message.reply_text("⚠️ لینک منقضی شده، دوباره بفرستید.")
+            return
+
+        if not check_daily_limit(user.id):
+            await query.message.reply_text(f"⛔ شما به سقف دانلود روزانه ({get_daily_limit()} مورد) رسیدید.")
+            return
+
+        ckey = cache_key(url, quality)
+        if ckey in active_url_jobs:
+            await query.answer("⚠️ این لینک الان در حال پردازش است.", show_alert=True)
+            return
+
+        job_id = uuid.uuid4().hex[:8]
+        if not register_active_job(ckey, job_id):
+            await query.answer("⚠️ این لینک الان در حال پردازش است.", show_alert=True)
+            return
+
+        try:
+            await query.message.delete()
+        except Exception:
+            pass
+
+        status_msg = await context.bot.send_message(
+            chat_id=query.message.chat_id,
+            text="⏳ در حال آماده‌سازی دانلود... لطفاً شکیبا باشید.",
+            reply_markup=cancel_download_keyboard(job_id)
+        )
+        task = asyncio.create_task(download_and_send(status_msg, user, url, quality, job_id, short_id))
+        active_downloads[job_id] = task
+        return
+
+# ---------------------------------------------------------------------------
 # منوی متنی
 # ---------------------------------------------------------------------------
 async def menu_text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1589,9 +1623,7 @@ async def menu_text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await record_user(user.id, user.username)
 
     if text == "📥 دانلود":
-        await update.message.reply_text(
-            "لینک پست یا ویدیو را بفرست تا گزینه‌های دانلود را نشان بدهم."
-        )
+        await update.message.reply_text("لینک پست یا ویدیو را بفرست تا گزینه‌های دانلود را نشان بدهم.")
 
     elif text == "👤 پروفایل":
         await update.message.reply_text(format_profile(user.id, user))
@@ -1632,7 +1664,7 @@ async def menu_text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await handle_links(update, context)
 
 # ---------------------------------------------------------------------------
-# اجرای اصلی
+# اجرا
 # ---------------------------------------------------------------------------
 def main():
     app = ApplicationBuilder().token(BOT_TOKEN).build()
@@ -1648,6 +1680,7 @@ def main():
     app.add_handler(CommandHandler("setvip", set_vip))
     app.add_handler(CommandHandler("limit", set_limit))
     app.add_handler(CommandHandler("users", users_list))
+    app.add_handler(CommandHandler("user", user_info_cmd))
     app.add_handler(CommandHandler("clearcache", clearcache_cmd))
     app.add_handler(CommandHandler("ping", ping_cmd))
     app.add_handler(CommandHandler("off", toggle_maintenance))
@@ -1655,19 +1688,8 @@ def main():
 
     app.add_handler(CallbackQueryHandler(button_handler))
 
-    app.add_handler(
-        MessageHandler(
-            filters.TEXT & ~filters.COMMAND,
-            menu_text_handler
-        )
-    )
-
-    app.add_handler(
-        MessageHandler(
-            filters.CAPTION & ~filters.COMMAND,
-            handle_links
-        )
-    )
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, menu_text_handler))
+    app.add_handler(MessageHandler(filters.CAPTION & ~filters.COMMAND, handle_links))
 
     if app.job_queue is not None:
         app.job_queue.run_repeating(cleanup_job, interval=1800, first=60)
