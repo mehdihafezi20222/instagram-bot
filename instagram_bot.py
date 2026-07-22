@@ -1,4 +1,3 @@
-
 import os
 import json
 import uuid
@@ -9,9 +8,8 @@ import logging
 import re
 from datetime import date, datetime
 from urllib.parse import urlparse, urlunparse, parse_qsl, urlencode
-from collections import Counter
-from cachetools import TTLCache
 
+from cachetools import TTLCache
 from telegram import (
     Update,
     InlineKeyboardButton,
@@ -54,8 +52,9 @@ stats_lock = asyncio.Lock()
 
 # کش‌ها
 url_cache = TTLCache(maxsize=1000, ttl=3600)          # short_id -> url
+quality_cache = TTLCache(maxsize=1000, ttl=3600)      # short_id -> [heights]
 preview_cache = TTLCache(maxsize=500, ttl=900)        # url -> preview info
-request_cache = TTLCache(maxsize=500, ttl=86400)      # cache_key -> cached result meta (fallback in RAM)
+request_cache = TTLCache(maxsize=500, ttl=86400)      # cache_key -> cached result meta
 
 # محدودیت تعداد دانلود همزمان
 MAX_CONCURRENT_DOWNLOADS = int(os.environ.get("MAX_CONCURRENT_DOWNLOADS", "3"))
@@ -69,7 +68,7 @@ active_url_jobs = {}             # cache_key -> job_id
 DEFAULT_DAILY_LIMIT = int(os.environ.get("DAILY_LIMIT", "10"))
 
 # پیام تشکر
-CREDIT_MESSAGE = "🙏 با تشکر از امپراطور ۲۸"
+CREDIT_MESSAGE = "🙏 با تشکر از امپراطور ۲۹"
 
 # چند ثانیه یک پوشه‌ی دانلود یتیم روی دیسک باقی بماند قبل از پاکسازی خودکار
 ORPHAN_MAX_AGE_SECONDS = 3600
@@ -241,19 +240,6 @@ def increment_daily_count(user_id: int):
     u["daily_count"] = u.get("daily_count", 0) + 1
     save_stats(stats)
 
-def extract_urls(text: str):
-    if not text:
-        return []
-    raw = [m.group(0).rstrip(").,]}'\"") for m in URL_RE.finditer(text)]
-    cleaned = []
-    seen = set()
-    for u in raw:
-        nu = normalize_url(u)
-        if nu and nu not in seen:
-            seen.add(nu)
-            cleaned.append(nu)
-    return cleaned
-
 def normalize_url(url: str) -> str:
     url = (url or "").strip()
     if not url:
@@ -267,7 +253,6 @@ def normalize_url(url: str) -> str:
         netloc = parsed.netloc.lower().replace("www.", "")
         if not any(d in netloc for d in SUPPORTED_DOMAINS):
             return ""
-        # برخی پارامترهای تبلیغاتی و مزاحم حذف شوند
         query = dict(parse_qsl(parsed.query, keep_blank_values=True))
         for k in ["utm_source", "utm_medium", "utm_campaign", "utm_term", "utm_content", "igsh", "fbclid", "si"]:
             query.pop(k, None)
@@ -277,6 +262,19 @@ def normalize_url(url: str) -> str:
         return urlunparse(parsed)
     except Exception:
         return ""
+
+def extract_urls(text: str):
+    if not text:
+        return []
+    raw = [m.group(0).rstrip(").,]}'\"") for m in URL_RE.finditer(text)]
+    cleaned = []
+    seen = set()
+    for u in raw:
+        nu = normalize_url(u)
+        if nu and nu not in seen:
+            seen.add(nu)
+            cleaned.append(nu)
+    return cleaned
 
 def site_from_url(url: str) -> str:
     try:
@@ -289,27 +287,44 @@ def site_from_url(url: str) -> str:
         return "Unknown"
 
 def quality_to_format(quality: str) -> str:
-    if quality == "audio":
+    q = str(quality).strip().lower()
+
+    if q == "audio":
         return "bestaudio/best"
-    if quality == "1080":
-        return "bv*[height<=1080]+ba/b[height<=1080]"
-    if quality == "720":
-        return "bv*[height<=720]+ba/b[height<=720]"
-    if quality == "480":
-        return "bv*[height<=480]+ba/b[height<=480]"
-    if quality == "360":
-        return "bv*[height<=360]+ba/b[height<=360]"
+
+    if q == "best":
+        return "bv*+ba/b"
+
+    if q.isdigit():
+        h = int(q)
+        # اول تلاش برای همان سقف کیفیت، بعد fallback به بهترین چیزی که شد
+        return f"bv*[height<={h}]+ba/b[height<={h}]/best"
+
+    if q == "1080":
+        return "bv*[height<=1080]+ba/b[height<=1080]/best"
+    if q == "720":
+        return "bv*[height<=720]+ba/b[height<=720]/best"
+    if q == "480":
+        return "bv*[height<=480]+ba/b[height<=480]/best"
+    if q == "360":
+        return "bv*[height<=360]+ba/b[height<=360]/best"
+
     return "bv*+ba/b"
 
 def quality_label(quality: str) -> str:
+    q = str(quality).strip().lower()
+    if q == "audio":
+        return "فقط صدا (MP3)"
+    if q == "best":
+        return "بهترین کیفیت"
+    if q.isdigit():
+        return f"{q}p"
     return {
-        "best": "بهترین کیفیت",
         "1080": "1080p",
         "720": "720p",
         "480": "480p",
         "360": "360p",
-        "audio": "فقط صدا (MP3)",
-    }.get(quality, quality)
+    }.get(q, quality)
 
 def get_level_text(download_count: int) -> str:
     if download_count >= 300:
@@ -393,15 +408,41 @@ def set_cached_media(url: str, quality: str, data: dict):
 
 def clear_runtime_cache():
     url_cache.clear()
+    quality_cache.clear()
     preview_cache.clear()
     request_cache.clear()
+
+def estimate_size(info: dict):
+    if not info:
+        return None
+    size = info.get("filesize") or info.get("filesize_approx")
+    if size:
+        return size
+    formats = info.get("formats") or []
+    sizes = [
+        f.get("filesize") or f.get("filesize_approx")
+        for f in formats
+        if f.get("filesize") or f.get("filesize_approx")
+    ]
+    return max(sizes) if sizes else None
+
+def get_available_heights(info: dict):
+    heights = sorted(
+        {
+            f.get("height")
+            for f in (info.get("formats") or [])
+            if f.get("height")
+        },
+        reverse=True
+    )
+    return heights
 
 def get_preview_text(info: dict, url: str) -> str:
     title = (info.get("title") or "").strip()
     duration = info.get("duration")
     size_bytes = estimate_size(info)
-    heights = sorted({f.get("height") for f in (info.get("formats") or []) if f.get("height")}, reverse=True)
-    top_heights = ", ".join(f"{h}p" for h in heights[:5]) if heights else "-"
+    heights = get_available_heights(info)
+    top_heights = ", ".join(f"{h}p" for h in heights[:10]) if heights else "-"
     lines = []
     if title:
         lines.append(f"🎬 {title[:150]}")
@@ -419,20 +460,6 @@ def get_preview_text(info: dict, url: str) -> str:
     lines.append(f"🎚 کیفیت‌های پیدا شده: {top_heights}")
     lines.append("یک کیفیت را انتخاب کن:")
     return "\n".join(lines)
-
-def estimate_size(info: dict):
-    if not info:
-        return None
-    size = info.get("filesize") or info.get("filesize_approx")
-    if size:
-        return size
-    formats = info.get("formats") or []
-    sizes = [
-        f.get("filesize") or f.get("filesize_approx")
-        for f in formats
-        if f.get("filesize") or f.get("filesize_approx")
-    ]
-    return max(sizes) if sizes else None
 
 async def is_channel_member(bot, user_id: int) -> bool:
     if not CHANNEL_USERNAME or is_admin(user_id):
@@ -455,14 +482,14 @@ async def fetch_preview_info(url: str):
 
     def _probe():
         opts = {
-            'quiet': True,
-            'no_warnings': True,
-            'ignoreerrors': True,
-            'skip_download': True,
-            'noplaylist': True,
-            'user_agent': (
-                'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
-                'AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+            "quiet": True,
+            "no_warnings": True,
+            "ignoreerrors": True,
+            "skip_download": True,
+            "noplaylist": True,
+            "user_agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
             ),
         }
         cookiefile = os.environ.get("YTDLP_COOKIES_FILE", "").strip()
@@ -478,9 +505,6 @@ async def fetch_preview_info(url: str):
         return result
     except Exception:
         return None
-
-def send_cached_response_helper(message, item: dict, caption: str = ""):
-    return _send_media_reply(message, item["kind"], item["file_id"], caption or item.get("caption") or "")
 
 async def _send_media_reply(message, kind: str, file_id: str, caption: str = ""):
     if kind == "photo":
@@ -556,7 +580,6 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def stats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
-    u = get_user_record(user.id)
     await update.message.reply_text(format_stats(user.id, user))
 
 # ---------------------------------------------------------------------------
@@ -816,16 +839,38 @@ def admin_keyboard():
         ]
     ])
 
-def quality_keyboard(short_id: str):
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("🎬 بهترین کیفیت", callback_data=f"q:best:{short_id}")],
-        [InlineKeyboardButton("📺 1080p", callback_data=f"q:1080:{short_id}")],
-        [InlineKeyboardButton("📺 720p", callback_data=f"q:720:{short_id}")],
-        [InlineKeyboardButton("📺 480p", callback_data=f"q:480:{short_id}")],
-        [InlineKeyboardButton("📺 360p", callback_data=f"q:360:{short_id}")],
-        [InlineKeyboardButton("🎧 فقط صدا (MP3)", callback_data=f"q:audio:{short_id}")],
-        [InlineKeyboardButton("❌ انصراف", callback_data="cancel_select")]
-    ])
+def quality_keyboard(short_id: str, heights=None):
+    buttons = []
+    heights = heights or []
+    unique_heights = []
+    seen = set()
+
+    for h in heights:
+        if h and str(h).isdigit():
+            h = int(h)
+            if h not in seen:
+                seen.add(h)
+                unique_heights.append(h)
+
+    unique_heights.sort(reverse=True)
+
+    if unique_heights:
+        # اول فقط کیفیت‌های واقعی موجود
+        for h in unique_heights:
+            buttons.append([
+                InlineKeyboardButton(f"📺 {h}p", callback_data=f"q:{h}:{short_id}")
+            ])
+        buttons.append([
+            InlineKeyboardButton("🎬 بهترین کیفیت", callback_data=f"q:best:{short_id}")
+        ])
+    else:
+        buttons.extend([
+            [InlineKeyboardButton("🎬 بهترین کیفیت", callback_data=f"q:best:{short_id}")],
+        ])
+
+    buttons.append([InlineKeyboardButton("🎧 فقط صدا (MP3)", callback_data=f"q:audio:{short_id}")])
+    buttons.append([InlineKeyboardButton("❌ انصراف", callback_data="cancel_select")])
+    return InlineKeyboardMarkup(buttons)
 
 def cancel_download_keyboard(job_id: str):
     return InlineKeyboardMarkup([
@@ -871,7 +916,6 @@ async def handle_links(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     urls = extract_urls(raw_text)
     if not urls:
-        # اگر متن صرفاً عادی بود، از منو محسوب نشده، پیام راهنما بده
         if update.message.text:
             await update.message.reply_text(
                 "⚠️ لینک معتبر پیدا نشد یا از این سایت‌ها پشتیبانی نمی‌شود.\n"
@@ -903,42 +947,33 @@ async def process_single_url(update: Update, context: ContextTypes.DEFAULT_TYPE,
     status_msg = await update.message.reply_text("🔎 در حال بررسی لینک...")
 
     preview_info = await fetch_preview_info(url)
+    heights = []
     if preview_info:
-        title = (preview_info.get("title") or "").strip()
-        size_bytes = estimate_size(preview_info)
+        heights = get_available_heights(preview_info)
+        quality_cache[short_id] = heights
         preview_text = get_preview_text(preview_info, url)
-        if title:
-            try:
-                await status_msg.edit_text(
-                    preview_text,
-                    reply_markup=quality_keyboard(short_id)
-                )
-            except Exception:
-                await status_msg.reply_text(
-                    preview_text,
-                    reply_markup=quality_keyboard(short_id)
-                )
-            return
-        if size_bytes:
-            try:
-                await status_msg.edit_text(
-                    preview_text,
-                    reply_markup=quality_keyboard(short_id)
-                )
-            except Exception:
-                await status_msg.reply_text(
-                    preview_text,
-                    reply_markup=quality_keyboard(short_id)
-                )
-            return
+        try:
+            await status_msg.edit_text(
+                preview_text,
+                reply_markup=quality_keyboard(short_id, heights)
+            )
+        except Exception:
+            await status_msg.reply_text(
+                preview_text,
+                reply_markup=quality_keyboard(short_id, heights)
+            )
+        return
 
     try:
         await status_msg.edit_text(
             "🎚 کیفیت مورد نظرت را انتخاب کن:",
-            reply_markup=quality_keyboard(short_id)
+            reply_markup=quality_keyboard(short_id, heights)
         )
     except Exception:
-        await status_msg.reply_text("🎚 کیفیت مورد نظرت را انتخاب کن:", reply_markup=quality_keyboard(short_id))
+        await status_msg.reply_text(
+            "🎚 کیفیت مورد نظرت را انتخاب کن:",
+            reply_markup=quality_keyboard(short_id, heights)
+        )
 
 # ---------------------------------------------------------------------------
 # هندلر دکمه‌ها
@@ -1076,11 +1111,15 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         short_id = uuid.uuid4().hex[:8]
         url_cache[short_id] = u["last_url"]
-        quality = u.get("last_quality") or "best"
+        last_quality = str(u.get("last_quality") or "best")
+        if last_quality.isdigit():
+            quality_cache[short_id] = [int(last_quality)]
+        else:
+            quality_cache[short_id] = []
         await query.message.edit_text(
-            f"🔁 آخرین دانلود شما آماده است.\nکیفیت قبلی: {quality_label(quality)}",
+            f"🔁 آخرین دانلود شما آماده است.\nکیفیت قبلی: {quality_label(last_quality)}",
             reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("🔁 با همان کیفیت", callback_data=f"q:{quality}:{short_id}")],
+                [InlineKeyboardButton("🔁 با همان کیفیت", callback_data=f"q:{last_quality}:{short_id}")],
                 [InlineKeyboardButton("🎚 انتخاب کیفیت دیگر", callback_data=f"redo:{short_id}")]
             ])
         )
@@ -1196,7 +1235,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not url:
             await query.message.edit_text("⚠️ لینک منقضی شده، لینک رو دوباره بفرست.")
             return
-        await query.message.edit_text("🎚 کیفیت مورد نظرت را انتخاب کن:", reply_markup=quality_keyboard(short_id))
+        heights = quality_cache.get(short_id, [])
+        await query.message.edit_text("🎚 کیفیت مورد نظرت را انتخاب کن:", reply_markup=quality_keyboard(short_id, heights))
         return
 
     if data.startswith("cancel_dl:"):
@@ -1225,6 +1265,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if ckey in active_url_jobs:
             await query.answer("⚠️ این لینک الان در حال پردازش است.", show_alert=True)
             return
+
         job_id = uuid.uuid4().hex[:8]
         if not register_active_job(ckey, job_id):
             await query.answer("⚠️ این لینک الان در حال پردازش است.", show_alert=True)
@@ -1290,7 +1331,6 @@ async def download_and_send(status_msg, user, url, quality, job_id, short_id):
                 pass
             return
 
-        # اگر کش نبود، دانلود واقعی انجام شود
         await _download_and_send_real(status_msg, user, url, quality, job_id, short_id, job_dir)
 
     finally:
@@ -1308,19 +1348,19 @@ async def download_and_send(status_msg, user, url, quality, job_id, short_id):
 
 async def _download_and_send_real(status_msg, user, url, quality, job_id, short_id, job_dir):
     ydl_opts = {
-        'outtmpl': f'{job_dir}/%(id)s_%(autonumber)s.%(ext)s',
-        'quiet': True,
-        'no_warnings': True,
-        'ignoreerrors': True,
-        'noplaylist': True,
-        'user_agent': (
-            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
-            'AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+        "outtmpl": f"{job_dir}/%(id)s_%(autonumber)s.%(ext)s",
+        "quiet": True,
+        "no_warnings": True,
+        "ignoreerrors": True,
+        "noplaylist": True,
+        "user_agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
         ),
-        'merge_output_format': 'mp4',
-        'format': quality_to_format(quality),
-        'extractor_args': {
-            'youtube': {'player_client': ['android', 'web']}
+        "merge_output_format": "mp4",
+        "format": quality_to_format(quality),
+        "extractor_args": {
+            "youtube": {"player_client": ["android", "web"]}
         },
     }
 
@@ -1329,14 +1369,13 @@ async def _download_and_send_real(status_msg, user, url, quality, job_id, short_
         ydl_opts["cookiefile"] = cookiefile
 
     if quality == "audio":
-        ydl_opts['postprocessors'] = [{
-            'key': 'FFmpegExtractAudio',
-            'preferredcodec': 'mp3',
-            'preferredquality': '192',
+        ydl_opts["postprocessors"] = [{
+            "key": "FFmpegExtractAudio",
+            "preferredcodec": "mp3",
+            "preferredquality": "192",
         }]
 
     loop = asyncio.get_running_loop()
-    attempt_errors = []
 
     if download_semaphore.locked():
         pos = queue_waiting_count() + 1
@@ -1389,7 +1428,6 @@ async def _download_and_send_real(status_msg, user, url, quality, job_id, short_
                 site_label = site_from_url(url)
 
                 for fname in files:
-                    lower = fname.lower()
                     kind = detect_local_kind(fname)
                     file_size = os.path.getsize(fname) if os.path.exists(fname) else 0
                     total_size += file_size
@@ -1455,14 +1493,13 @@ async def _download_and_send_real(status_msg, user, url, quality, job_id, short_
                 raise
 
             except Exception as e:
-                attempt_errors.append(str(e))
                 logger.exception("خطا در دانلود (attempt %s)", attempt)
                 await record_error()
 
                 if attempt < 3:
                     try:
                         await status_msg.edit_text(
-                            f"⚠️ خطا در دانلود. تلاش مجدد {attempt+1}/3 ...",
+                            f"⚠️ خطا در دانلود. تلاش مجدد {attempt + 1}/3 ...",
                             reply_markup=cancel_download_keyboard(job_id)
                         )
                     except Exception:
@@ -1544,54 +1581,8 @@ async def cleanup_job(context: ContextTypes.DEFAULT_TYPE):
         logger.exception("خطا در پاکسازی خودکار")
 
 # ---------------------------------------------------------------------------
-# اجرای اصلی
+# منوی متنی
 # ---------------------------------------------------------------------------
-def main():
-    app = ApplicationBuilder().token(BOT_TOKEN).build()
-
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("help", help_cmd))
-    app.add_handler(CommandHandler("stats", stats_cmd))
-
-    app.add_handler(CommandHandler("admin", admin_panel))
-    app.add_handler(CommandHandler("broadcast", broadcast))
-    app.add_handler(CommandHandler("ban", ban_user))
-    app.add_handler(CommandHandler("unban", unban_user))
-    app.add_handler(CommandHandler("setvip", set_vip))
-    app.add_handler(CommandHandler("limit", set_limit))
-    app.add_handler(CommandHandler("users", users_list))
-    app.add_handler(CommandHandler("clearcache", clearcache_cmd))
-    app.add_handler(CommandHandler("ping", ping_cmd))
-    app.add_handler(CommandHandler("off", toggle_maintenance))
-    app.add_handler(CommandHandler("on", toggle_maintenance))
-
-    app.add_handler(CallbackQueryHandler(button_handler))
-
-    app.add_handler(
-        MessageHandler(
-            filters.TEXT & ~filters.COMMAND,
-            menu_text_handler
-        )
-    )
-
-    app.add_handler(
-        MessageHandler(
-            filters.CAPTION & ~filters.COMMAND,
-            handle_links
-        )
-    )
-
-    if app.job_queue is not None:
-        app.job_queue.run_repeating(cleanup_job, interval=1800, first=60)
-    else:
-        logger.warning(
-            "JobQueue فعال نیست؛ برای پاکسازی خودکار پکیج "
-            "'python-telegram-bot[job-queue]' را نصب کنید."
-        )
-
-    print("ربات روشن شد...")
-    app.run_polling()
-
 async def menu_text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text
     user = update.effective_user
@@ -1640,6 +1631,54 @@ async def menu_text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         await handle_links(update, context)
 
+# ---------------------------------------------------------------------------
+# اجرای اصلی
+# ---------------------------------------------------------------------------
+def main():
+    app = ApplicationBuilder().token(BOT_TOKEN).build()
+
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("help", help_cmd))
+    app.add_handler(CommandHandler("stats", stats_cmd))
+
+    app.add_handler(CommandHandler("admin", admin_panel))
+    app.add_handler(CommandHandler("broadcast", broadcast))
+    app.add_handler(CommandHandler("ban", ban_user))
+    app.add_handler(CommandHandler("unban", unban_user))
+    app.add_handler(CommandHandler("setvip", set_vip))
+    app.add_handler(CommandHandler("limit", set_limit))
+    app.add_handler(CommandHandler("users", users_list))
+    app.add_handler(CommandHandler("clearcache", clearcache_cmd))
+    app.add_handler(CommandHandler("ping", ping_cmd))
+    app.add_handler(CommandHandler("off", toggle_maintenance))
+    app.add_handler(CommandHandler("on", toggle_maintenance))
+
+    app.add_handler(CallbackQueryHandler(button_handler))
+
+    app.add_handler(
+        MessageHandler(
+            filters.TEXT & ~filters.COMMAND,
+            menu_text_handler
+        )
+    )
+
+    app.add_handler(
+        MessageHandler(
+            filters.CAPTION & ~filters.COMMAND,
+            handle_links
+        )
+    )
+
+    if app.job_queue is not None:
+        app.job_queue.run_repeating(cleanup_job, interval=1800, first=60)
+    else:
+        logger.warning(
+            "JobQueue فعال نیست؛ برای پاکسازی خودکار پکیج "
+            "'python-telegram-bot[job-queue]' را نصب کنید."
+        )
+
+    print("ربات روشن شد...")
+    app.run_polling()
 
 if __name__ == "__main__":
     main()
