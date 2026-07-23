@@ -606,6 +606,57 @@ async def _download_direct_media_candidates(info: dict, job_dir: str, url: str) 
 
     return saved_files
 
+def _scrape_instagram_images(url: str) -> list[str]:
+    """
+    فال‌بک بدون نیاز به لاگین: برای پست‌های عمومی اینستاگرام (از جمله آلبوم عکس)
+    که yt-dlp نمی‌تواند کامل استخراج کند، آدرس عکس‌ها از HTML صفحه‌ی عمومی پست
+    استخراج می‌شود. فقط روی پست‌های عمومی (غیرخصوصی) کار می‌کند.
+    """
+    try:
+        headers = {
+            "User-Agent": (
+                "Mozilla/5.0 (Linux; Android 10; SM-G975F) AppleWebKit/537.36 "
+                "(KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36"
+            ),
+            "Accept-Language": "en-US,en;q=0.9",
+        }
+        req = Request(url, headers=headers)
+        with urlopen(req, timeout=20) as resp:
+            html = resp.read().decode("utf-8", errors="ignore")
+    except Exception:
+        return []
+
+    raw_urls = re.findall(r'"display_url":"([^"]+)"', html)
+
+    seen = set()
+    cleaned = []
+    for u in raw_urls:
+        try:
+            u = u.encode().decode("unicode_escape").replace("\\/", "/")
+        except Exception:
+            u = u.replace("\\/", "/")
+        if u.startswith("http") and u not in seen:
+            seen.add(u)
+            cleaned.append(u)
+    return cleaned
+
+
+def _scrape_tiktok_images(url: str) -> list[str]:
+    """
+    فال‌بک بدون نیاز به لاگین: برای پست‌های اسلایدشو/عکسی تیک‌تاک که yt-dlp
+    نمی‌تواند عکس‌ها را استخراج کند، از یک API عمومی و بدون‌لاگین استفاده می‌شود.
+    """
+    try:
+        api_url = "https://www.tikwm.com/api/?url=" + url
+        req = Request(api_url, headers={"User-Agent": "Mozilla/5.0"})
+        with urlopen(req, timeout=20) as resp:
+            data = json.loads(resp.read().decode("utf-8", errors="ignore"))
+        images = (data.get("data") or {}).get("images") or []
+        return [i for i in images if isinstance(i, str) and i.startswith("http")]
+    except Exception:
+        return []
+
+
 def get_preview_text(info: dict, url: str) -> str:
     title = (info.get("title") or "").strip()
     duration = info.get("duration")
@@ -1409,6 +1460,18 @@ async def _download_and_send_real(status_msg, user, url, quality, job_id, short_
 
                 if not files:
                     fallback_files = await _download_direct_media_candidates(info, job_dir, url)
+
+                    if not fallback_files and is_image:
+                        scraped_urls = []
+                        if is_instagram:
+                            scraped_urls = await asyncio.to_thread(_scrape_instagram_images, url)
+                        elif "tiktok.com" in url.lower():
+                            scraped_urls = await asyncio.to_thread(_scrape_tiktok_images, url)
+
+                        if scraped_urls:
+                            fake_info = {"entries": [{"url": u} for u in scraped_urls]}
+                            fallback_files = await _download_direct_media_candidates(fake_info, job_dir, url)
+
                     if fallback_files:
                         files = fallback_files
                     else:
