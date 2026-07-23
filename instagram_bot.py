@@ -308,8 +308,11 @@ def site_from_url(url: str) -> str:
     except Exception:
         return "Unknown"
 
-def quality_to_format(quality: str) -> str:
+def quality_to_format(quality: str):
     q = str(quality).strip().lower()
+    if q == "image":
+        # عکس‌ها فرمت ویدیویی ندارند؛ نباید فرمت ویدیویی به yt-dlp تحمیل کنیم
+        return None
     if q == "audio":
         return "bestaudio/best"
     if q == "best":
@@ -321,6 +324,8 @@ def quality_to_format(quality: str) -> str:
 
 def quality_label(quality: str) -> str:
     q = str(quality).strip().lower()
+    if q == "image":
+        return "عکس"
     if q == "audio":
         return "فقط صدا (MP3)"
     if q == "best":
@@ -437,6 +442,26 @@ def get_available_heights(info: dict):
         },
         reverse=True
     )
+
+def is_image_only(info: dict) -> bool:
+    """
+    تشخیص می‌دهد که آیا محتوای این پست فقط عکس است (بدون هیچ فرمت ویدیویی).
+    برای پست‌های عکسی اینستاگرام/فیسبوک/... این مورد True برمی‌گردد.
+    """
+    if not info:
+        return False
+    ext = (info.get("ext") or "").lower().strip(".")
+    if f".{ext}" in IMAGE_EXTS:
+        return True
+    formats = info.get("formats") or []
+    if formats:
+        has_video = any(
+            (f.get("vcodec") not in (None, "none")) or f.get("height")
+            for f in formats
+        )
+        return not has_video
+    # اگر نه فرمت ویدیویی دارد و نه لیست فرمت، و duration هم صفر/خالی است، احتمالاً عکس است
+    return not info.get("duration")
 
 def get_preview_text(info: dict, url: str) -> str:
     title = (info.get("title") or "").strip()
@@ -1121,6 +1146,34 @@ async def process_single_url(update: Update, context: ContextTypes.DEFAULT_TYPE,
     status_msg = await update.message.reply_text("🔎 در حال بررسی لینک...")
 
     preview_info = await fetch_preview_info(url)
+
+    # --- بخش عکس: اگر پست فقط عکس است، مستقیم دانلود می‌شود، بدون منوی کیفیت ویدیو ---
+    if preview_info and is_image_only(preview_info):
+        try:
+            await status_msg.edit_text("🖼 این یک پست عکسی است، در حال دانلود...")
+        except Exception:
+            pass
+
+        ckey = cache_key(url, "image")
+        job_id = uuid.uuid4().hex[:8]
+        if not register_active_job(ckey, job_id):
+            await status_msg.edit_text("⚠️ این لینک الان در حال پردازش است.")
+            return
+
+        STATE.active_download_meta[job_id] = {
+            "user_id": user.id,
+            "username": user.username or "",
+            "url": url,
+            "quality": "image",
+            "started": now_iso(),
+        }
+        task = asyncio.create_task(
+            download_and_send(status_msg, user, url, "image", job_id, short_id)
+        )
+        STATE.active_downloads[job_id] = task
+        return
+    # --- پایان بخش عکس ---
+
     heights = []
     if preview_info:
         heights = get_available_heights(preview_info)
@@ -1192,6 +1245,8 @@ async def download_and_send(status_msg, user, url, quality, job_id, short_id):
             pass
 
 async def _download_and_send_real(status_msg, user, url, quality, job_id, short_id, job_dir):
+    is_image = str(quality).strip().lower() == "image"
+
     ydl_opts = {
         "outtmpl": f"{job_dir}/%(id)s_%(autonumber)s.%(ext)s",
         "quiet": True,
@@ -1202,12 +1257,17 @@ async def _download_and_send_real(status_msg, user, url, quality, job_id, short_
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
             "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
         ),
-        "merge_output_format": "mp4",
-        "format": quality_to_format(quality),
         "extractor_args": {
             "youtube": {"player_client": ["android", "web"]},
         },
     }
+
+    # عکس‌ها نباید merge_output_format یا فرمت ویدیویی داشته باشند وگرنه yt-dlp شکست می‌خورد
+    fmt = quality_to_format(quality)
+    if fmt:
+        ydl_opts["format"] = fmt
+    if not is_image:
+        ydl_opts["merge_output_format"] = "mp4"
 
     if CONFIG.ytdlp_cookies_file and os.path.exists(CONFIG.ytdlp_cookies_file):
         ydl_opts["cookiefile"] = CONFIG.ytdlp_cookies_file
@@ -1235,8 +1295,9 @@ async def _download_and_send_real(status_msg, user, url, quality, job_id, short_
         for attempt in range(1, 4):
             try:
                 try:
+                    label = "🖼 دانلود عکس شروع شد" if is_image else f"⬇️ دانلود شروع شد\n🎚 کیفیت: {quality_label(quality)}"
                     await status_msg.edit_text(
-                        f"⬇️ دانلود شروع شد\n🎚 کیفیت: {quality_label(quality)}\n⏳ لطفاً شکیبا باشید.",
+                        f"{label}\n⏳ لطفاً شکیبا باشید.",
                         reply_markup=cancel_download_keyboard(job_id),
                     )
                 except Exception:
