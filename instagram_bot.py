@@ -80,7 +80,7 @@ logger = logging.getLogger("instagram_downloader_bot")
 # ---------------------------------------------------------------------------
 DOWNLOAD_DIR = "downloads"
 STATS_FILE = "stats.json"
-CREDIT_MESSAGE = "🙏 با تشکر از امپراطور جاودانه"   # تغییر داده شد
+CREDIT_MESSAGE = "🙏 با تشکر از امپراطور جاودانه"
 
 SUPPORTED_DOMAINS = [
     "instagram.com", "youtube.com", "youtu.be",
@@ -452,25 +452,40 @@ def get_available_heights(info: dict):
         reverse=True
     )
 
+# ========== تشخیص دقیق‌تر عکس ==========
 def is_image_only(info: dict) -> bool:
     if not info:
         return False
 
+    # اگر خود info یک فایل با ext عکس است
     ext = (info.get("ext") or "").lower().strip(".")
+    if ext in IMAGE_EXTS:
+        return True
 
-    if not info.get("formats") and not info.get("entries"):
-        if f".{ext}" in IMAGE_EXTS:
-            return True
-        return not info.get("duration")
+    # اگر entries وجود دارد (آلبوم)
+    entries = info.get("entries")
+    if entries:
+        # اگر همه entries عکس باشند
+        for e in entries:
+            if not is_image_only(e):
+                return False
+        return True
 
+    # اگر formats وجود دارد
     formats = info.get("formats") or []
     if formats:
-        has_video = any(f.get("vcodec") not in (None, "none") for f in formats)
-        return not has_video
+        # اگر هیچ فرمتی vcodec نداشته باشد
+        has_video = any(f.get("vcodec') not in (None, "none") for f in formats)
+        if not has_video:
+            return True
+        # همچنین اگر همه فرمت‌ها عکس باشند (ext در IMAGE_EXTS)
+        all_images = all(f.get("ext") in IMAGE_EXTS for f in formats if f.get("ext"))
+        if all_images:
+            return True
 
-    entries = [e for e in (info.get("entries") or []) if e]
-    if entries:
-        return all(is_image_only(e) for e in entries)
+    # اگر هیچ فرمت و entries نباشد، و duration نداشته باشد، احتمالاً عکس است
+    if not info.get("duration") and not formats and not entries:
+        return True
 
     return False
 
@@ -481,6 +496,7 @@ def infer_download_mode(info: dict | None, url: str = "") -> str:
         ext = (info.get("ext") or "").lower().strip(".")
         if f".{ext}" in IMAGE_EXTS:
             return "image"
+        # اگر duration نداشته باشد و فرمت‌ها شامل ویدیو نباشند
         if not info.get("duration") and not any(
             (f or {}).get("vcodec") not in (None, "none")
             for f in (info.get("formats") or [])
@@ -496,7 +512,7 @@ def infer_download_mode(info: dict | None, url: str = "") -> str:
             pass
 
     return "video"
-
+# ========== پایان بخش تشخیص ==========
 
 def _iter_media_url_candidates(value):
     if isinstance(value, dict):
@@ -1216,7 +1232,6 @@ async def handle_links(update: Update, context: ContextTypes.DEFAULT_TYPE):
     for url in urls:
         await process_single_url(update, context, url)
 
-# ========== تغییر اصلی: دانلود خودکار عکس بدون منوی کیفیت ==========
 async def process_single_url(update: Update, context: ContextTypes.DEFAULT_TYPE, url: str):
     user = update.effective_user
     if STATE.stats.get("maintenance", False) and user.id not in CONFIG.admin_ids:
@@ -1245,14 +1260,14 @@ async def process_single_url(update: Update, context: ContextTypes.DEFAULT_TYPE,
 
     preview_info = await fetch_preview_info(url)
 
-    # --- اگر پست عکسی است، مستقیماً دانلود کن (بدون نمایش منوی کیفیت) ---
+    # ========== تغییر: تشخیص عکس با تابع اصلاح‌شده ==========
     if infer_download_mode(preview_info, url) == "image":
         try:
             await status_msg.edit_text("🖼 این یک پست عکسی است، در حال دانلود...")
         except Exception:
             pass
 
-        ckey = cache_key(url, "best")   # کیفیت best برای عکس
+        ckey = cache_key(url, "best")
         job_id = uuid.uuid4().hex[:8]
         if not register_active_job(ckey, job_id):
             await status_msg.edit_text("⚠️ این لینک الان در حال پردازش است.")
@@ -1262,7 +1277,7 @@ async def process_single_url(update: Update, context: ContextTypes.DEFAULT_TYPE,
             "user_id": user.id,
             "username": user.username or "",
             "url": url,
-            "quality": "best",        # بهترین کیفیت عکس
+            "quality": "best",
             "started": now_iso(),
         }
         task = asyncio.create_task(
@@ -1270,7 +1285,7 @@ async def process_single_url(update: Update, context: ContextTypes.DEFAULT_TYPE,
         )
         STATE.active_downloads[job_id] = task
         return
-    # --- پایان بخش عکس ---
+    # ========== پایان تغییر ==========
 
     # برای ویدیوها و سایر محتواها، منوی کیفیت نمایش داده شود
     heights = []
@@ -1289,7 +1304,6 @@ async def process_single_url(update: Update, context: ContextTypes.DEFAULT_TYPE,
     except Exception:
         await status_msg.reply_text("🎚 کیفیت مورد نظرت را انتخاب کن:", reply_markup=quality_keyboard(short_id, heights))
 
-# ========== پایان تغییر ==========
 
 async def download_and_send(status_msg, user, url, quality, job_id, short_id, preview_info=None):
     job_dir = os.path.join(DOWNLOAD_DIR, job_id)
@@ -1365,7 +1379,8 @@ async def _download_and_send_real(status_msg, user, url, quality, job_id, short_
         "quiet": True,
         "no_warnings": True,
         "ignoreerrors": True,
-        "noplaylist": ("instagram.com" not in url.lower()) or ("img_index=" in url),
+        # برای عکس‌ها (آلبوم) noplaylist را false می‌کنیم تا همه آیتم‌ها دانلود شوند
+        "noplaylist": (not is_image) and (("instagram.com" not in url.lower()) or ("img_index=" in url)),
         "user_agent": (
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
             "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
