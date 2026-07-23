@@ -77,7 +77,7 @@ logger = logging.getLogger("instagram_downloader_bot")
 # ---------------------------------------------------------------------------
 DOWNLOAD_DIR = "downloads"
 STATS_FILE = "stats.json"
-CREDIT_MESSAGE = "🙏 با تشکر از امپراطور ۳۳"
+CREDIT_MESSAGE = "🙏 با تشکر از امپراطور ۳۴"
 
 SUPPORTED_DOMAINS = [
     "instagram.com", "youtube.com", "youtu.be",
@@ -909,7 +909,7 @@ async def broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if failed_ids:
         shown = ", ".join(failed_ids[:20])
         more = "" if len(failed_ids) <= 20 else f" (+{len(failed_ids) - 20} مورد دیگر)"
-        report += f"\n\n🚫 آیدی‌های ناموفق:\n{shown}{more}"
+        report += f"\n\n?? آیدی‌های ناموفق:\n{shown}{more}"
 
     await status_msg.edit_text(report, parse_mode=ParseMode.MARKDOWN)
 
