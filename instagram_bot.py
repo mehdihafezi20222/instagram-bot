@@ -6,9 +6,12 @@ import time
 import asyncio
 import logging
 import re
+import mimetypes
+from copy import deepcopy
 from dataclasses import dataclass
 from datetime import date, datetime
 from urllib.parse import urlparse, urlunparse, parse_qsl, urlencode
+from urllib.request import Request, urlopen
 
 from cachetools import TTLCache
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup
@@ -84,6 +87,13 @@ SUPPORTED_DOMAINS = [
     "twitter.com", "x.com", "tiktok.com",
     "facebook.com", "fb.watch"
 ]
+
+def is_supported_host(netloc: str) -> bool:
+    netloc = (netloc or "").lower().replace("www.", "")
+    for domain in SUPPORTED_DOMAINS:
+        if netloc == domain or netloc.endswith("." + domain):
+            return True
+    return False
 
 IMAGE_EXTS = (".jpg", ".jpeg", ".png", ".webp")
 AUDIO_EXTS = (".mp3", ".m4a", ".aac", ".ogg", ".wav", ".opus")
@@ -201,7 +211,7 @@ def get_daily_limit() -> int:
 
 def get_user_record(user_id: int):
     uid = str(user_id)
-    rec = STATE.stats["users"].setdefault(uid, dict(DEFAULT_USER))
+    rec = STATE.stats["users"].setdefault(uid, deepcopy(DEFAULT_USER))
     for k, v in DEFAULT_USER.items():
         rec.setdefault(k, v)
     if not isinstance(rec.get("sites"), dict):
@@ -214,7 +224,7 @@ async def record_user(user_id: int, username: str):
     async with STATE.lock:
         uid = str(user_id)
         if uid not in STATE.stats["users"]:
-            STATE.stats["users"][uid] = dict(DEFAULT_USER)
+            STATE.stats["users"][uid] = deepcopy(DEFAULT_USER)
             STATE.stats["users"][uid]["username"] = username or ""
         else:
             if username:
@@ -273,7 +283,7 @@ def normalize_url(url: str) -> str:
     try:
         parsed = urlparse(url)
         netloc = parsed.netloc.lower().replace("www.", "")
-        if not any(d in netloc for d in SUPPORTED_DOMAINS):
+        if not is_supported_host(netloc):
             return ""
         query = dict(parse_qsl(parsed.query, keep_blank_values=True))
         for k in ["utm_source", "utm_medium", "utm_campaign", "utm_term", "utm_content", "igsh", "fbclid", "si"]:
@@ -482,8 +492,17 @@ def infer_download_mode(info: dict | None, url: str = "") -> str:
     - "image" برای پست‌های فقط عکس
     - "video" برای بقیه
     """
-    if info and is_image_only(info):
-        return "image"
+    if info:
+        if is_image_only(info):
+            return "image"
+        ext = (info.get("ext") or "").lower().strip(".")
+        if f".{ext}" in IMAGE_EXTS:
+            return "image"
+        if not info.get("duration") and not any(
+            (f or {}).get("vcodec") not in (None, "none")
+            for f in (info.get("formats") or [])
+        ) and info.get("formats"):
+            return "image"
 
     if url:
         try:
@@ -494,6 +513,109 @@ def infer_download_mode(info: dict | None, url: str = "") -> str:
             pass
 
     return "video"
+
+
+def _iter_media_url_candidates(value):
+    """از ساختار yt-dlp هر URL قابل دانلودی را استخراج می‌کند."""
+    if isinstance(value, dict):
+        for key in ("url", "display_url", "thumbnail", "thumbnail_url", "original_url", "source_url", "webpage_url"):
+            candidate = value.get(key)
+            if isinstance(candidate, str) and candidate.startswith(("http://", "https://")):
+                yield candidate
+
+        for child_key in ("entries", "formats", "requested_formats", "thumbnails"):
+            child = value.get(child_key)
+            if isinstance(child, list):
+                for item in child:
+                    yield from _iter_media_url_candidates(item)
+
+        for child in value.values():
+            if isinstance(child, dict):
+                yield from _iter_media_url_candidates(child)
+            elif isinstance(child, list):
+                for item in child:
+                    yield from _iter_media_url_candidates(item)
+
+    elif isinstance(value, list):
+        for item in value:
+            yield from _iter_media_url_candidates(item)
+
+
+def _guess_ext_from_url_or_type(url: str, content_type: str | None = None) -> str:
+    try:
+        path_ext = os.path.splitext(urlparse(url).path)[1].lower()
+        if path_ext:
+            return path_ext
+    except Exception:
+        pass
+
+    if content_type:
+        ctype = content_type.split(";")[0].strip().lower()
+        guessed = mimetypes.guess_extension(ctype) or ""
+        if guessed:
+            return guessed
+
+    return ".bin"
+
+
+async def _download_direct_media_candidates(info: dict, job_dir: str, url: str) -> list[str]:
+    """
+    وقتی yt-dlp فایل نساخت، از URLهای مستقیم داخل info/entries
+    فایل را به‌صورت دستی دانلود می‌کند. این برای پست‌های عکسی/کاروسل
+    اینستاگرام fallback حیاتی است.
+    """
+    candidates = []
+    seen = set()
+    for candidate in _iter_media_url_candidates(info or {}):
+        if candidate not in seen:
+            seen.add(candidate)
+            candidates.append(candidate)
+
+    # اول URLهای مرتبط‌تر با خود پست، بعد بقیه
+    def _priority(u: str) -> tuple[int, str]:
+        ext = os.path.splitext(urlparse(u).path)[1].lower()
+        if ext in IMAGE_EXTS:
+            return (0, u)
+        if ext in VIDEO_EXTS:
+            return (1, u)
+        if ext in AUDIO_EXTS:
+            return (2, u)
+        return (3, u)
+
+    candidates.sort(key=_priority)
+
+    saved_files = []
+
+    def _download_one(candidate_url: str, index: int):
+        headers = {
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+            )
+        }
+        req = Request(candidate_url, headers=headers)
+        with urlopen(req, timeout=30) as resp:
+            content_type = (resp.headers.get_content_type() if resp.headers else "") or ""
+            if not content_type.startswith(("image/", "video/", "audio/")):
+                # بعضی پاسخ‌ها چیز دیگری هستند؛ همان‌ها را ذخیره نکن
+                return None
+
+            ext = _guess_ext_from_url_or_type(candidate_url, content_type)
+            out_name = f"direct_{index:02d}{ext}"
+            out_path = os.path.join(job_dir, out_name)
+            with open(out_path, "wb") as f:
+                shutil.copyfileobj(resp, f)
+            return out_path
+
+    for idx, candidate_url in enumerate(candidates[:12], start=1):
+        try:
+            saved = await asyncio.to_thread(_download_one, candidate_url, idx)
+            if saved and os.path.exists(saved) and os.path.getsize(saved) > 0:
+                saved_files.append(saved)
+        except Exception:
+            continue
+
+    return saved_files
 def get_preview_text(info: dict, url: str) -> str:
     title = (info.get("title") or "").strip()
     duration = info.get("duration")
@@ -1181,7 +1303,7 @@ async def process_single_url(update: Update, context: ContextTypes.DEFAULT_TYPE,
     preview_info = await fetch_preview_info(url)
 
     # --- بخش عکس: اگر پست فقط عکس است، مستقیم دانلود می‌شود، بدون منوی کیفیت ویدیو ---
-    if preview_info and is_image_only(preview_info):
+    if infer_download_mode(preview_info, url) == "image":
         try:
             await status_msg.edit_text("🖼 این یک پست عکسی است، در حال دانلود...")
         except Exception:
@@ -1366,7 +1488,11 @@ async def _download_and_send_real(status_msg, user, url, quality, job_id, short_
                 ]
 
                 if not files:
-                    raise RuntimeError("فایلی دانلود نشد.")
+                    fallback_files = await _download_direct_media_candidates(info, job_dir, url)
+                    if fallback_files:
+                        files = fallback_files
+                    else:
+                        raise RuntimeError("فایلی دانلود نشد.")
 
                 try:
                     await status_msg.edit_text("📤 در حال ارسال فایل...", reply_markup=None)
