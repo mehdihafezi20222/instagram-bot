@@ -80,7 +80,7 @@ logger = logging.getLogger("instagram_downloader_bot")
 # ---------------------------------------------------------------------------
 DOWNLOAD_DIR = "downloads"
 STATS_FILE = "stats.json"
-CREDIT_MESSAGE = "🙏 با تشکر از امپراطور ۳۴"
+CREDIT_MESSAGE = "🙏 با تشکر از پادشاه"   # تغییر داده شد
 
 SUPPORTED_DOMAINS = [
     "instagram.com", "youtube.com", "youtu.be",
@@ -321,7 +321,6 @@ def site_from_url(url: str) -> str:
 def quality_to_format(quality: str):
     q = str(quality).strip().lower()
     if q == "image":
-        # عکس‌ها فرمت ویدیویی ندارند؛ نباید فرمت ویدیویی به yt-dlp تحمیل کنیم
         return None
     if q == "audio":
         return "bestaudio/best"
@@ -454,24 +453,14 @@ def get_available_heights(info: dict):
     )
 
 def is_image_only(info: dict) -> bool:
-    """
-    تشخیص می‌دهد که آیا محتوای این پست فقط عکس است (بدون هیچ فرمت ویدیویی).
-    برای پست‌های عکسی اینستاگرام/فیسبوک/... این مورد True برمی‌گردد.
-
-    نکته‌ی مهم: فرمت‌های عکسی هم معمولاً فیلد height/width دارند، پس نباید
-    فقط بر اساس وجود 'height' تشخیص داد که فرمت ویدیویی است؛ ملاک اصلی
-    وجود کدک ویدیو (vcodec) است.
-    """
     if not info:
         return False
 
     ext = (info.get("ext") or "").lower().strip(".")
 
-    # پست تکی که مستقیم یک فایل عکس است (بدون لیست formats)
     if not info.get("formats") and not info.get("entries"):
         if f".{ext}" in IMAGE_EXTS:
             return True
-        # اگر duration ندارد، احتمال زیاد عکس است؛ نبودن ext مانع تشخیص نشود
         return not info.get("duration")
 
     formats = info.get("formats") or []
@@ -479,7 +468,6 @@ def is_image_only(info: dict) -> bool:
         has_video = any(f.get("vcodec") not in (None, "none") for f in formats)
         return not has_video
 
-    # پست چند-آیتمی (کاروسل عکس/ویدیو ترکیبی)
     entries = [e for e in (info.get("entries") or []) if e]
     if entries:
         return all(is_image_only(e) for e in entries)
@@ -487,11 +475,6 @@ def is_image_only(info: dict) -> bool:
     return False
 
 def infer_download_mode(info: dict | None, url: str = "") -> str:
-    """
-    خروجی را برای مسیر دانلود مشخص می‌کند:
-    - "image" برای پست‌های فقط عکس
-    - "video" برای بقیه
-    """
     if info:
         if is_image_only(info):
             return "image"
@@ -516,7 +499,6 @@ def infer_download_mode(info: dict | None, url: str = "") -> str:
 
 
 def _iter_media_url_candidates(value):
-    """از ساختار yt-dlp هر URL قابل دانلودی را استخراج می‌کند."""
     if isinstance(value, dict):
         for key in ("url", "display_url", "thumbnail", "thumbnail_url", "original_url", "source_url", "webpage_url"):
             candidate = value.get(key)
@@ -558,12 +540,8 @@ def _guess_ext_from_url_or_type(url: str, content_type: str | None = None) -> st
     return ".bin"
 
 
+# ========== اصلاح شده: بدون نیاز به کوکی، فقط با هدرهای قوی ==========
 async def _download_direct_media_candidates(info: dict, job_dir: str, url: str) -> list[str]:
-    """
-    وقتی yt-dlp فایل نساخت، از URLهای مستقیم داخل info/entries
-    فایل را به‌صورت دستی دانلود می‌کند. این برای پست‌های عکسی/کاروسل
-    اینستاگرام fallback حیاتی است.
-    """
     candidates = []
     seen = set()
     for candidate in _iter_media_url_candidates(info or {}):
@@ -571,7 +549,6 @@ async def _download_direct_media_candidates(info: dict, job_dir: str, url: str) 
             seen.add(candidate)
             candidates.append(candidate)
 
-    # اول URLهای مرتبط‌تر با خود پست، بعد بقیه
     def _priority(u: str) -> tuple[int, str]:
         ext = os.path.splitext(urlparse(u).path)[1].lower()
         if ext in IMAGE_EXTS:
@@ -584,32 +561,37 @@ async def _download_direct_media_candidates(info: dict, job_dir: str, url: str) 
 
     candidates.sort(key=_priority)
 
+    # هدرهای قوی برای شبیه‌سازی مرورگر
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        ),
+        "Referer": url,
+        "Accept": "image/*,video/*,audio/*;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Accept-Encoding": "gzip, deflate, br",
+        "Connection": "keep-alive",
+        "Sec-Fetch-Dest": "image",
+        "Sec-Fetch-Mode": "no-cors",
+        "Sec-Fetch-Site": "cross-site",
+    }
+
     saved_files = []
 
     def _download_one(candidate_url: str, index: int):
-        # اضافه کردن Referer و هدرهای بیشتر برای عبور از محدودیت‌ها
-        headers = {
-            "User-Agent": (
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-            ),
-            "Referer": url,
-            "Accept": "image/*,video/*,audio/*;q=0.9,*/*;q=0.8",
-        }
         req = Request(candidate_url, headers=headers)
         with urlopen(req, timeout=30) as resp:
-            # سازگاری بیشتر با روش‌های مختلف سرور
             content_type = (resp.headers.get("Content-Type") if resp.headers else "") or ""
             ctype_main = content_type.split(";", 1)[0].strip().lower() if content_type else ""
 
-            # اگر Content-Type به‌صورت واضح فرمت مناسب نیست، اما URL پسوند دارد، قبولش کن
             if ctype_main and not ctype_main.startswith(("image/", "video/", "audio/")):
-                # احتمال اینکه پاسخ HTML یا خطا باشد — نپذیرفتن
+                logger.debug("Content-Type نامناسب: %s", ctype_main)
                 return None
             if not ctype_main:
-                # اگر Content-Type خالی است، چک کن که URL خودش پسوند مناسب داشته باشد
                 path_ext = os.path.splitext(urlparse(candidate_url).path)[1].lower()
                 if not path_ext or path_ext not in IMAGE_EXTS + VIDEO_EXTS + AUDIO_EXTS:
+                    logger.debug("پسوند نامشخص و Content-Type خالی")
                     return None
 
             ext = _guess_ext_from_url_or_type(candidate_url, content_type)
@@ -618,7 +600,6 @@ async def _download_direct_media_candidates(info: dict, job_dir: str, url: str) 
             with open(out_path, "wb") as f:
                 shutil.copyfileobj(resp, f)
 
-            # مطمئن شو فایل حداقل چند بایت دارد
             if os.path.exists(out_path) and os.path.getsize(out_path) > 0:
                 return out_path
             return None
@@ -628,11 +609,14 @@ async def _download_direct_media_candidates(info: dict, job_dir: str, url: str) 
             saved = await asyncio.to_thread(_download_one, candidate_url, idx)
             if saved and os.path.exists(saved) and os.path.getsize(saved) > 0:
                 saved_files.append(saved)
-        except Exception:
-            # اگر یک candidate شکست خورد، به بقیه ادامه بده
+        except Exception as e:
+            logger.debug("خطا در دانلود مستقیم %s: %s", candidate_url, e)
             continue
 
     return saved_files
+# ========== پایان اصلاح ==========
+
+
 def get_preview_text(info: dict, url: str) -> str:
     title = (info.get("title") or "").strip()
     duration = info.get("duration")
@@ -683,8 +667,6 @@ async def fetch_preview_info(url: str):
             "no_warnings": True,
             "ignoreerrors": True,
             "skip_download": True,
-            # اگر لینک به یک آیتم مشخص از کاروسل اشاره دارد (img_index=)،
-            # فقط همان آیتم را بگیر، نه کل کاروسل را
             "noplaylist": ("instagram.com" not in url.lower()) or ("img_index=" in url),
             "user_agent": (
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -907,7 +889,6 @@ def redo_keyboard(short_id: str):
     return InlineKeyboardMarkup([[InlineKeyboardButton("🔁 دانلود دوباره با کیفیت دیگه", callback_data=f"redo:{short_id}")]])
 
 def build_history_keyboard(user_id: int):
-    """کیبورد تاریخچه حرفه‌ای: هر آیتم یک دکمه‌ی «دانلود دوباره» دارد."""
     u = get_user_record(user_id)
     history = u.get("history", [])[:10]
     rows = []
@@ -1155,7 +1136,6 @@ async def ping_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await msg.edit_text(f"🏓 Pong\n⏱ پاسخ: {elapsed}ms")
 
 async def live_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """آمار لحظه‌ای دانلودهای در حال اجرا (ادمین)."""
     if update.effective_user.id not in CONFIG.admin_ids:
         return
     if not STATE.active_downloads:
@@ -1177,7 +1157,6 @@ async def live_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("\n".join(lines))
 
 async def ig_search_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """جستجوی چند پست اخیر یک پیج اینستاگرام: /ig username"""
     user = update.effective_user
     await record_user(user.id, user.username)
 
@@ -1417,6 +1396,7 @@ async def download_and_send(status_msg, user, url, quality, job_id, short_id, pr
             pass
 
 
+# ========== اصلاح: تنظیم format ==========
 async def _download_and_send_real(status_msg, user, url, quality, job_id, short_id, job_dir, preview_info=None):
     if preview_info is None:
         preview_info = await fetch_preview_info(url)
@@ -1436,8 +1416,6 @@ async def _download_and_send_real(status_msg, user, url, quality, job_id, short_
         "quiet": True,
         "no_warnings": True,
         "ignoreerrors": True,
-        # اگر لینک به یک آیتم مشخص از کاروسل اشاره دارد (img_index=)،
-        # فقط همان آیتم را بگیر، نه کل کاروسل را
         "noplaylist": ("instagram.com" not in url.lower()) or ("img_index=" in url),
         "user_agent": (
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -1448,8 +1426,8 @@ async def _download_and_send_real(status_msg, user, url, quality, job_id, short_
         },
     }
 
-    # عکس‌ها نباید merge_output_format یا فرمت ویدیویی داشته باشند وگرنه yt-dlp شکست می‌خورد
-    fmt = None if is_image else quality_to_format(quality)
+    # برای تصاویر، فرمت "best" را تنظیم می‌کنیم
+    fmt = "best" if is_image else quality_to_format(quality)
     if fmt:
         ydl_opts["format"] = fmt
     if not is_image:
@@ -1585,9 +1563,6 @@ async def _download_and_send_real(status_msg, user, url, quality, job_id, short_
             except Exception as e:
                 logger.exception("خطا در دانلود (attempt %s)", attempt)
 
-                # اگر خطا مربوط به نبود فرمت ویدیویی است (یعنی احتمالاً این یک پست عکسی
-                # است که قبلاً به‌عنوان عکس تشخیص داده نشده)، فرمت ویدیویی را کنار بگذار
-                # و بدون شمردنش به‌عنوان یک تلاش شکست‌خورده‌ی معمولی، دوباره امتحان کن.
                 err_lower = str(e).lower()
                 is_format_error = (
                     "requested format is not available" in err_lower
@@ -1641,6 +1616,7 @@ async def _download_and_send_real(status_msg, user, url, quality, job_id, short_
                     except Exception:
                         pass
                     return
+# ========== پایان اصلاح ==========
 
 async def record_download(user_id: int, url: str = "", quality: str = "", size_bytes: int = 0, site: str = "", title: str = ""):
     async with STATE.lock:
