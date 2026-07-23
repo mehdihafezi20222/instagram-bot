@@ -6,16 +6,13 @@ import time
 import asyncio
 import logging
 import re
+from dataclasses import dataclass
 from datetime import date, datetime
 from urllib.parse import urlparse, urlunparse, parse_qsl, urlencode
 
 from cachetools import TTLCache
-from telegram import (
-    Update,
-    InlineKeyboardButton,
-    InlineKeyboardMarkup,
-    ReplyKeyboardMarkup,
-)
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup
+from telegram.constants import ParseMode, ChatMemberStatus
 from telegram.ext import (
     ApplicationBuilder,
     CommandHandler,
@@ -24,50 +21,68 @@ from telegram.ext import (
     ContextTypes,
     filters,
 )
-from telegram.constants import ParseMode, ChatMemberStatus
 import yt_dlp
 
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+# ---------------------------------------------------------------------------
+# Config
+# ---------------------------------------------------------------------------
+@dataclass(frozen=True)
+class Config:
+    bot_token: str
+    admin_ids: set[int]
+    channel_username: str
+    daily_limit: int
+    max_concurrent_downloads: int
+    max_file_size_mb: int
+    cleanup_interval_seconds: int
+    orphan_max_age_seconds: int
+    ytdlp_cookies_file: str
+    log_level: str
+    maintenance_default: bool
 
-# ---------------------------------------------------------------------------
-# تنظیمات پایه
-# ---------------------------------------------------------------------------
-BOT_TOKEN = os.environ.get("BOT_TOKEN")
-if not BOT_TOKEN:
+def load_config() -> Config:
+    raw_admins = os.environ.get("ADMIN_IDS", "").replace(" ", "").split(",")
+    admin_ids = {int(x) for x in raw_admins if x.isdigit()}
+
+    return Config(
+        bot_token=os.environ.get("BOT_TOKEN", "").strip(),
+        admin_ids=admin_ids,
+        channel_username=os.environ.get("CHANNEL_USERNAME", "").strip(),
+        daily_limit=int(os.environ.get("DAILY_LIMIT", "10")),
+        max_concurrent_downloads=int(os.environ.get("MAX_CONCURRENT_DOWNLOADS", "3")),
+        max_file_size_mb=int(os.environ.get("MAX_FILE_SIZE_MB", "500")),
+        cleanup_interval_seconds=int(os.environ.get("CLEANUP_INTERVAL_SECONDS", "1800")),
+        orphan_max_age_seconds=int(os.environ.get("ORPHAN_MAX_AGE_SECONDS", "3600")),
+        ytdlp_cookies_file=os.environ.get("YTDLP_COOKIES_FILE", "").strip(),
+        log_level=os.environ.get("LOG_LEVEL", "INFO").upper(),
+        maintenance_default=os.environ.get("MAINTENANCE_DEFAULT", "false").lower() == "true",
+    )
+
+CONFIG = load_config()
+
+if not CONFIG.bot_token:
     raise RuntimeError("متغیر BOT_TOKEN در Railway تنظیم نشده است.")
 
-ADMIN_IDS = set()
-raw_admins = os.environ.get("ADMIN_IDS", "").replace(" ", "").split(",")
-for x in raw_admins:
-    if x.isdigit():
-        ADMIN_IDS.add(int(x))
+# ---------------------------------------------------------------------------
+# Logging
+# ---------------------------------------------------------------------------
+logging.basicConfig(
+    level=getattr(logging, CONFIG.log_level, logging.INFO),
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+)
+logger = logging.getLogger("instagram_downloader_bot")
 
-CHANNEL_USERNAME = os.environ.get("CHANNEL_USERNAME", "").strip()
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
 DOWNLOAD_DIR = "downloads"
-os.makedirs(DOWNLOAD_DIR, exist_ok=True)
-
 STATS_FILE = "stats.json"
-stats_lock = asyncio.Lock()
-
-url_cache = TTLCache(maxsize=1000, ttl=3600)      # short_id -> url
-quality_cache = TTLCache(maxsize=1000, ttl=3600)  # short_id -> [heights]
-preview_cache = TTLCache(maxsize=500, ttl=900)    # url -> info
-request_cache = TTLCache(maxsize=500, ttl=86400)
-
-MAX_CONCURRENT_DOWNLOADS = int(os.environ.get("MAX_CONCURRENT_DOWNLOADS", "3"))
-download_semaphore = asyncio.Semaphore(MAX_CONCURRENT_DOWNLOADS)
-
-active_downloads = {}     # job_id -> task
-active_url_jobs = {}      # cache_key -> job_id
-
-DEFAULT_DAILY_LIMIT = int(os.environ.get("DAILY_LIMIT", "10"))
-CREDIT_MESSAGE = "🙏 با تشکر از امپراطور ۲۹"
-ORPHAN_MAX_AGE_SECONDS = 3600
+CREDIT_MESSAGE = "🙏 با تشکر از امپراطور ۳۰"
 
 SUPPORTED_DOMAINS = [
     "instagram.com", "youtube.com", "youtu.be",
-    "twitter.com", "x.com", "tiktok.com", "facebook.com", "fb.watch"
+    "twitter.com", "x.com", "tiktok.com",
+    "facebook.com", "fb.watch"
 ]
 
 IMAGE_EXTS = (".jpg", ".jpeg", ".png", ".webp")
@@ -107,65 +122,85 @@ DEFAULT_USER = {
     "last_title": "",
 }
 
+os.makedirs(DOWNLOAD_DIR, exist_ok=True)
+
 # ---------------------------------------------------------------------------
-# ذخیره‌سازی
+# State / Storage
 # ---------------------------------------------------------------------------
-def load_stats():
-    if os.path.exists(STATS_FILE):
+class BotState:
+    def __init__(self):
+        self.lock = asyncio.Lock()
+        self.url_cache = TTLCache(maxsize=1000, ttl=3600)
+        self.quality_cache = TTLCache(maxsize=1000, ttl=3600)
+        self.preview_cache = TTLCache(maxsize=500, ttl=900)
+        self.request_cache = TTLCache(maxsize=500, ttl=86400)
+        self.download_semaphore = asyncio.Semaphore(CONFIG.max_concurrent_downloads)
+        self.active_downloads = {}
+        self.active_url_jobs = {}
+        self.stats = self.load_stats()
+
+    def load_stats(self):
+        if os.path.exists(STATS_FILE):
+            try:
+                with open(STATS_FILE, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                    data.setdefault("total_downloads", 0)
+                    data.setdefault("total_errors", 0)
+                    data.setdefault("users", {})
+                    data.setdefault("banned", [])
+                    data.setdefault("maintenance", CONFIG.maintenance_default)
+                    data.setdefault("broadcast_count", 0)
+                    data.setdefault("last_broadcast_failed", [])
+                    data.setdefault("telegram_cache", {})
+                    data.setdefault("daily_limit", CONFIG.daily_limit)
+                    return data
+            except Exception:
+                logger.exception("خطا در خواندن stats.json")
+        return {
+            "total_downloads": 0,
+            "total_errors": 0,
+            "users": {},
+            "banned": [],
+            "maintenance": CONFIG.maintenance_default,
+            "broadcast_count": 0,
+            "last_broadcast_failed": [],
+            "telegram_cache": {},
+            "daily_limit": CONFIG.daily_limit,
+        }
+
+    def save_stats(self):
         try:
-            with open(STATS_FILE, "r", encoding="utf-8") as f:
-                data = json.load(f)
-                data.setdefault("total_downloads", 0)
-                data.setdefault("total_errors", 0)
-                data.setdefault("users", {})
-                data.setdefault("banned", [])
-                data.setdefault("maintenance", False)
-                data.setdefault("broadcast_count", 0)
-                data.setdefault("last_broadcast_failed", [])
-                data.setdefault("telegram_cache", {})
-                data.setdefault("daily_limit", DEFAULT_DAILY_LIMIT)
-                return data
+            with open(STATS_FILE, "w", encoding="utf-8") as f:
+                json.dump(self.stats, f, ensure_ascii=False, indent=2)
         except Exception:
-            logger.exception("خطا در خواندن stats.json")
-    return {
-        "total_downloads": 0,
-        "total_errors": 0,
-        "users": {},
-        "banned": [],
-        "maintenance": False,
-        "broadcast_count": 0,
-        "last_broadcast_failed": [],
-        "telegram_cache": {},
-        "daily_limit": DEFAULT_DAILY_LIMIT,
-    }
+            logger.exception("خطا در ذخیره stats.json")
 
-def save_stats(data):
-    try:
-        with open(STATS_FILE, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
-    except Exception:
-        logger.exception("خطا در ذخیره stats.json")
+    def clear_runtime_cache(self):
+        self.url_cache.clear()
+        self.quality_cache.clear()
+        self.preview_cache.clear()
+        self.request_cache.clear()
 
-stats = load_stats()
+STATE = BotState()
 
 # ---------------------------------------------------------------------------
-# ابزارها
+# Helpers
 # ---------------------------------------------------------------------------
 def now_iso():
     return datetime.utcnow().isoformat(timespec="seconds")
 
 def is_admin(user_id: int) -> bool:
-    return user_id in ADMIN_IDS
+    return user_id in CONFIG.admin_ids
 
 def get_daily_limit() -> int:
     try:
-        return int(stats.get("daily_limit", DEFAULT_DAILY_LIMIT))
+        return int(STATE.stats.get("daily_limit", CONFIG.daily_limit))
     except Exception:
-        return DEFAULT_DAILY_LIMIT
+        return CONFIG.daily_limit
 
 def get_user_record(user_id: int):
     uid = str(user_id)
-    rec = stats["users"].setdefault(uid, dict(DEFAULT_USER))
+    rec = STATE.stats["users"].setdefault(uid, dict(DEFAULT_USER))
     for k, v in DEFAULT_USER.items():
         rec.setdefault(k, v)
     if not isinstance(rec.get("sites"), dict):
@@ -175,18 +210,18 @@ def get_user_record(user_id: int):
     return rec
 
 async def record_user(user_id: int, username: str):
-    async with stats_lock:
+    async with STATE.lock:
         uid = str(user_id)
-        if uid not in stats["users"]:
-            stats["users"][uid] = dict(DEFAULT_USER)
-            stats["users"][uid]["username"] = username or ""
+        if uid not in STATE.stats["users"]:
+            STATE.stats["users"][uid] = dict(DEFAULT_USER)
+            STATE.stats["users"][uid]["username"] = username or ""
         else:
             if username:
-                stats["users"][uid]["username"] = username
+                STATE.stats["users"][uid]["username"] = username
             for k, v in DEFAULT_USER.items():
-                stats["users"][uid].setdefault(k, v)
-        stats["users"][uid]["last_seen"] = now_iso()
-        save_stats(stats)
+                STATE.stats["users"][uid].setdefault(k, v)
+        STATE.stats["users"][uid]["last_seen"] = now_iso()
+        STATE.save_stats()
 
 def human_size(num_bytes):
     try:
@@ -200,7 +235,7 @@ def human_size(num_bytes):
     return f"{num:.1f} PB"
 
 def queue_waiting_count():
-    waiters = getattr(download_semaphore, "_waiters", None)
+    waiters = getattr(STATE.download_semaphore, "_waiters", None)
     try:
         return len(waiters) if waiters else 0
     except Exception:
@@ -224,7 +259,7 @@ def increment_daily_count(user_id: int):
         u["daily_date"] = today
         u["daily_count"] = 0
     u["daily_count"] = u.get("daily_count", 0) + 1
-    save_stats(stats)
+    STATE.save_stats()
 
 def normalize_url(url: str) -> str:
     url = (url or "").strip()
@@ -274,26 +309,13 @@ def site_from_url(url: str) -> str:
 
 def quality_to_format(quality: str) -> str:
     q = str(quality).strip().lower()
-
     if q == "audio":
         return "bestaudio/best"
-
     if q == "best":
         return "bv*+ba/b"
-
     if q.isdigit():
         h = int(q)
         return f"bv*[height<={h}]+ba/b[height<={h}]/best"
-
-    if q == "1080":
-        return "bv*[height<=1080]+ba/b[height<=1080]/best"
-    if q == "720":
-        return "bv*[height<=720]+ba/b[height<=720]/best"
-    if q == "480":
-        return "bv*[height<=480]+ba/b[height<=480]/best"
-    if q == "360":
-        return "bv*[height<=360]+ba/b[height<=360]/best"
-
     return "bv*+ba/b"
 
 def quality_label(quality: str) -> str:
@@ -367,35 +389,29 @@ def format_stats(user_id: int, user) -> str:
     )
 
 def prune_telegram_cache(max_items: int = 200):
-    cache = stats.get("telegram_cache", {})
+    cache = STATE.stats.get("telegram_cache", {})
     if not isinstance(cache, dict):
-        stats["telegram_cache"] = {}
+        STATE.stats["telegram_cache"] = {}
         return
     if len(cache) <= max_items:
         return
     items = sorted(cache.items(), key=lambda kv: kv[1].get("updated_at", 0), reverse=True)
-    stats["telegram_cache"] = dict(items[:max_items])
+    STATE.stats["telegram_cache"] = dict(items[:max_items])
 
 def cache_key(url: str, quality: str) -> str:
     return f"{normalize_url(url)}||{quality}"
 
 def get_cached_media(url: str, quality: str):
     ck = cache_key(url, quality)
-    return stats.get("telegram_cache", {}).get(ck)
+    return STATE.stats.get("telegram_cache", {}).get(ck)
 
 def set_cached_media(url: str, quality: str, data: dict):
     ck = cache_key(url, quality)
-    stats.setdefault("telegram_cache", {})
-    stats["telegram_cache"][ck] = data
-    stats["telegram_cache"][ck]["updated_at"] = time.time()
+    STATE.stats.setdefault("telegram_cache", {})
+    STATE.stats["telegram_cache"][ck] = data
+    STATE.stats["telegram_cache"][ck]["updated_at"] = time.time()
     prune_telegram_cache(200)
-    save_stats(stats)
-
-def clear_runtime_cache():
-    url_cache.clear()
-    quality_cache.clear()
-    preview_cache.clear()
-    request_cache.clear()
+    STATE.save_stats()
 
 def estimate_size(info: dict):
     if not info:
@@ -446,22 +462,22 @@ def get_preview_text(info: dict, url: str) -> str:
     return "\n".join(lines)
 
 async def is_channel_member(bot, user_id: int) -> bool:
-    if not CHANNEL_USERNAME or is_admin(user_id):
+    if not CONFIG.channel_username or is_admin(user_id):
         return True
     try:
-        member = await bot.get_chat_member(chat_id=CHANNEL_USERNAME, user_id=user_id)
+        member = await bot.get_chat_member(chat_id=CONFIG.channel_username, user_id=user_id)
         return member.status in [
             ChatMemberStatus.MEMBER,
             ChatMemberStatus.ADMINISTRATOR,
-            ChatMemberStatus.OWNER
+            ChatMemberStatus.OWNER,
         ]
     except Exception:
         logger.warning("خطا در بررسی عضویت کاربر %s در کانال", user_id)
         return True
 
 async def fetch_preview_info(url: str):
-    if url in preview_cache:
-        return preview_cache[url]
+    if url in STATE.preview_cache:
+        return STATE.preview_cache[url]
 
     loop = asyncio.get_running_loop()
 
@@ -477,19 +493,28 @@ async def fetch_preview_info(url: str):
                 "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
             ),
         }
-        cookiefile = os.environ.get("YTDLP_COOKIES_FILE", "").strip()
-        if cookiefile and os.path.exists(cookiefile):
-            opts["cookiefile"] = cookiefile
+        if CONFIG.ytdlp_cookies_file and os.path.exists(CONFIG.ytdlp_cookies_file):
+            opts["cookiefile"] = CONFIG.ytdlp_cookies_file
         with yt_dlp.YoutubeDL(opts) as ydl:
             return ydl.extract_info(url, download=False)
 
     try:
         result = await loop.run_in_executor(None, _probe)
         if result:
-            preview_cache[url] = result
+            STATE.preview_cache[url] = result
         return result
     except Exception:
         return None
+
+def detect_local_kind(fname: str) -> str:
+    lower = fname.lower()
+    if lower.endswith(IMAGE_EXTS):
+        return "photo"
+    if lower.endswith(AUDIO_EXTS):
+        return "audio"
+    if lower.endswith(VIDEO_EXTS):
+        return "video"
+    return "document"
 
 async def _send_media_reply(message, kind: str, file_id: str, caption: str = ""):
     if kind == "photo":
@@ -498,8 +523,6 @@ async def _send_media_reply(message, kind: str, file_id: str, caption: str = "")
         return await message.reply_audio(audio=file_id, caption=caption or None)
     if kind == "video":
         return await message.reply_video(video=file_id, caption=caption or None, supports_streaming=True)
-    if kind == "document":
-        return await message.reply_document(document=file_id, caption=caption or None)
     return await message.reply_document(document=file_id, caption=caption or None)
 
 async def _send_local_file(message, fname: str, caption: str = "", send_caption: bool = True):
@@ -513,25 +536,15 @@ async def _send_local_file(message, fname: str, caption: str = "", send_caption:
             return await message.reply_video(video=f, caption=caption if send_caption else None, supports_streaming=True)
         return await message.reply_document(document=f, caption=caption if send_caption else None)
 
-def detect_local_kind(fname: str) -> str:
-    lower = fname.lower()
-    if lower.endswith(IMAGE_EXTS):
-        return "photo"
-    if lower.endswith(AUDIO_EXTS):
-        return "audio"
-    if lower.endswith(VIDEO_EXTS):
-        return "video"
-    return "document"
-
 def register_active_job(key: str, job_id: str) -> bool:
-    if key in active_url_jobs:
+    if key in STATE.active_url_jobs:
         return False
-    active_url_jobs[key] = job_id
+    STATE.active_url_jobs[key] = job_id
     return True
 
 def unregister_active_job(key: str, job_id: str):
-    if active_url_jobs.get(key) == job_id:
-        active_url_jobs.pop(key, None)
+    if STATE.active_url_jobs.get(key) == job_id:
+        STATE.active_url_jobs.pop(key, None)
 
 def get_today_stats():
     today = date.today().isoformat()
@@ -539,7 +552,7 @@ def get_today_stats():
     active_users_today = 0
     site_counts = {}
 
-    for uid, rec in stats.get("users", {}).items():
+    for uid, rec in STATE.stats.get("users", {}).items():
         if rec.get("daily_date") == today and rec.get("daily_count", 0) > 0:
             downloads_today += rec.get("daily_count", 0)
             active_users_today += 1
@@ -561,7 +574,7 @@ def get_today_stats():
     }
 
 def find_user_record_by_id(user_id: int):
-    return stats.get("users", {}).get(str(user_id))
+    return STATE.stats.get("users", {}).get(str(user_id))
 
 def format_user_admin_card(user_id: int):
     rec = find_user_record_by_id(user_id)
@@ -589,7 +602,7 @@ def format_user_admin_card(user_id: int):
     )
 
 # ---------------------------------------------------------------------------
-# پیام‌های عمومی
+# Keyboard builders
 # ---------------------------------------------------------------------------
 def main_menu():
     return ReplyKeyboardMarkup(
@@ -599,7 +612,7 @@ def main_menu():
             ["🔔 اعلان‌ها", "🚀 امکانات حرفه‌ای"],
             ["🛠 پنل ادمین", "💬 پشتیبانی"],
         ],
-        resize_keyboard=True
+        resize_keyboard=True,
     )
 
 def settings_keyboard():
@@ -612,7 +625,7 @@ def settings_keyboard():
             InlineKeyboardButton("🔔 اعلان‌ها", callback_data="settings_notify"),
             InlineKeyboardButton("♻️ بازنشانی تنظیمات", callback_data="settings_reset"),
         ],
-        [InlineKeyboardButton("🔙 بازگشت", callback_data="back_main")]
+        [InlineKeyboardButton("🔙 بازگشت", callback_data="back_main")],
     ])
 
 def interaction_keyboard():
@@ -625,7 +638,7 @@ def interaction_keyboard():
             InlineKeyboardButton("📢 دعوت دوستان", callback_data="invite"),
             InlineKeyboardButton("📨 ارسال پیام", callback_data="sendmsg"),
         ],
-        [InlineKeyboardButton("🔙 بازگشت", callback_data="back_main")]
+        [InlineKeyboardButton("🔙 بازگشت", callback_data="back_main")],
     ])
 
 def pro_keyboard():
@@ -639,7 +652,7 @@ def pro_keyboard():
             InlineKeyboardButton("⭐ VIP", callback_data="vip"),
         ],
         [InlineKeyboardButton("🎁 کد دعوت", callback_data="referral")],
-        [InlineKeyboardButton("🔙 بازگشت", callback_data="back_main")]
+        [InlineKeyboardButton("🔙 بازگشت", callback_data="back_main")],
     ])
 
 def admin_keyboard():
@@ -660,7 +673,7 @@ def admin_keyboard():
             InlineKeyboardButton("🔧 تنظیمات ربات", callback_data="admin_settings"),
             InlineKeyboardButton("🛠 تغییر حالت تعمیرات", callback_data="admin_maintenance"),
         ],
-        [InlineKeyboardButton("❌ بستن پنل", callback_data="admin_close")]
+        [InlineKeyboardButton("❌ بستن پنل", callback_data="admin_close")],
     ])
 
 def quality_keyboard(short_id: str, heights=None):
@@ -696,27 +709,29 @@ def redo_keyboard(short_id: str):
     return InlineKeyboardMarkup([[InlineKeyboardButton("🔁 دانلود دوباره با کیفیت دیگه", callback_data=f"redo:{short_id}")]])
 
 def force_join_keyboard():
-    ch_clean = CHANNEL_USERNAME.replace("@", "")
+    ch_clean = CONFIG.channel_username.replace("@", "")
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("📢 عضویت در کانال", url=f"https://t.me/{ch_clean}")],
         [InlineKeyboardButton("✅ بررسی عضویت", callback_data="check_join")]
     ])
 
+# ---------------------------------------------------------------------------
+# Commands
+# ---------------------------------------------------------------------------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     await record_user(user.id, user.username)
 
-    if user.id in stats.get("banned", []):
+    if user.id in STATE.stats.get("banned", []):
         await update.message.reply_text("🚫 شما مسدود شده‌اید.")
         return
 
     u = get_user_record(user.id)
     greeted = "خوش آمدید دوباره" if u.get("count", 0) else "خوش آمدید"
     await update.message.reply_text(
-        f"سلام {user.first_name or 'دوست عزیز'} 👋\n"
-        f"{greeted}\n\n"
+        f"سلام {user.first_name or 'دوست عزیز'} 👋\n{greeted}\n\n"
         "لینک پست یا ویدیو را بفرست تا گزینه‌های دانلود را نشان بدهم.",
-        reply_markup=main_menu()
+        reply_markup=main_menu(),
     )
 
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -726,7 +741,7 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• می‌توانی چند لینک را در یک پیام بفرستی\n"
         "• از منو برای تنظیمات و امکانات بیشتر استفاده کن\n"
         "• ادمین‌ها می‌توانند از پنل ادمین استفاده کنند",
-        reply_markup=main_menu()
+        reply_markup=main_menu(),
     )
 
 async def stats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -735,25 +750,25 @@ async def stats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
-    if user_id not in ADMIN_IDS:
+    if user_id not in CONFIG.admin_ids:
         await update.message.reply_text(
             f"⛔ دسترسی غیرمجاز!\nآیدی تلگرام شما: `{user_id}`",
-            parse_mode=ParseMode.MARKDOWN
+            parse_mode=ParseMode.MARKDOWN,
         )
         return
 
-    active_running = len(active_downloads)
-    cache_count = len(stats.get("telegram_cache", {}))
+    active_running = len(STATE.active_downloads)
+    cache_count = len(STATE.stats.get("telegram_cache", {}))
     today = get_today_stats()
 
     text = (
         "🛠 *پنل مدیریت ربات*\n\n"
-        f"👥 تعداد کاربران: {len(stats['users'])}\n"
-        f"📥 دانلودهای موفق: {stats['total_downloads']}\n"
-        f"❌ مجموع خطاها: {stats['total_errors']}\n"
-        f"🛠 حالت تعمیرات: {'فعال 🛠' if stats.get('maintenance') else 'غیرفعال 🟢'}\n"
-        f"🚫 کاربران مسدود: {len(stats.get('banned', []))}\n"
-        f"📢 ارسال همگانی انجام‌شده: {stats.get('broadcast_count', 0)}\n"
+        f"👥 تعداد کاربران: {len(STATE.stats['users'])}\n"
+        f"📥 دانلودهای موفق: {STATE.stats['total_downloads']}\n"
+        f"❌ مجموع خطاها: {STATE.stats['total_errors']}\n"
+        f"🛠 حالت تعمیرات: {'فعال 🛠' if STATE.stats.get('maintenance') else 'غیرفعال 🟢'}\n"
+        f"🚫 کاربران مسدود: {len(STATE.stats.get('banned', []))}\n"
+        f"📢 ارسال همگانی انجام‌شده: {STATE.stats.get('broadcast_count', 0)}\n"
         f"⏳ دانلودهای فعال: {active_running}\n"
         f"🧠 کش فایل تلگرام: {cache_count}\n"
         f"📆 سقف دانلود روزانه: {get_daily_limit()}\n\n"
@@ -765,10 +780,10 @@ async def admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
-    if user_id not in ADMIN_IDS:
+    if user_id not in CONFIG.admin_ids:
         await update.message.reply_text(
             f"⛔ دسترسی غیرمجاز!\nآیدی تلگرام شما: `{user_id}`",
-            parse_mode=ParseMode.MARKDOWN
+            parse_mode=ParseMode.MARKDOWN,
         )
         return
 
@@ -782,7 +797,7 @@ async def broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "`/broadcast سلام به همه`\n\n"
             "2) عکس/ویدیو:\n"
             "روی پیام ریپلای کن و بزن `/broadcast`",
-            parse_mode=ParseMode.MARKDOWN
+            parse_mode=ParseMode.MARKDOWN,
         )
         return
 
@@ -790,7 +805,7 @@ async def broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
     success, failed = 0, 0
     failed_ids = []
 
-    for uid_str in list(stats["users"].keys()):
+    for uid_str in list(STATE.stats["users"].keys()):
         try:
             uid = int(uid_str)
             if msg_to_send:
@@ -803,10 +818,10 @@ async def broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
             failed += 1
             failed_ids.append(uid_str)
 
-    async with stats_lock:
-        stats["broadcast_count"] = stats.get("broadcast_count", 0) + 1
-        stats["last_broadcast_failed"] = failed_ids
-        save_stats(stats)
+    async with STATE.lock:
+        STATE.stats["broadcast_count"] = STATE.stats.get("broadcast_count", 0) + 1
+        STATE.stats["last_broadcast_failed"] = failed_ids
+        STATE.save_stats()
 
     report = f"📊 گزارش ارسال همگانی:\n\n✅ موفق: {success}\n❌ ناموفق: {failed}"
     if failed_ids:
@@ -817,79 +832,76 @@ async def broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await status_msg.edit_text(report, parse_mode=ParseMode.MARKDOWN)
 
 async def user_info_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id not in ADMIN_IDS:
+    if update.effective_user.id not in CONFIG.admin_ids:
         return
     if not context.args or not context.args[0].isdigit():
         await update.message.reply_text("استفاده: `/user USER_ID`", parse_mode=ParseMode.MARKDOWN)
         return
     uid = int(context.args[0])
-    text = format_user_admin_card(uid)
-    await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
+    await update.message.reply_text(format_user_admin_card(uid), parse_mode=ParseMode.MARKDOWN)
 
 async def ban_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id not in ADMIN_IDS:
+    if update.effective_user.id not in CONFIG.admin_ids:
         return
     if context.args and context.args[0].isdigit():
         uid = int(context.args[0])
-        if uid not in stats["banned"]:
-            stats["banned"].append(uid)
-            save_stats(stats)
+        if uid not in STATE.stats["banned"]:
+            STATE.stats["banned"].append(uid)
+            STATE.save_stats()
         await update.message.reply_text(f"🚫 کاربر {uid} مسدود شد.")
     else:
         await update.message.reply_text("استفاده: `/ban USER_ID`", parse_mode=ParseMode.MARKDOWN)
 
 async def unban_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id not in ADMIN_IDS:
+    if update.effective_user.id not in CONFIG.admin_ids:
         return
     if context.args and context.args[0].isdigit():
         uid = int(context.args[0])
-        if uid in stats["banned"]:
-            stats["banned"].remove(uid)
-            save_stats(stats)
+        if uid in STATE.stats["banned"]:
+            STATE.stats["banned"].remove(uid)
+            STATE.save_stats()
         await update.message.reply_text(f"✅ کاربر {uid} آزاد شد.")
     else:
         await update.message.reply_text("استفاده: `/unban USER_ID`", parse_mode=ParseMode.MARKDOWN)
 
 async def toggle_maintenance(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id not in ADMIN_IDS:
+    if update.effective_user.id not in CONFIG.admin_ids:
         return
-    stats["maintenance"] = not stats.get("maintenance", False)
-    save_stats(stats)
-    await update.message.reply_text(f"⚙️ حالت تعمیرات: {'فعال 🛠' if stats['maintenance'] else 'غیرفعال 🟢'}")
+    STATE.stats["maintenance"] = not STATE.stats.get("maintenance", False)
+    STATE.save_stats()
+    await update.message.reply_text(f"⚙️ حالت تعمیرات: {'فعال 🛠' if STATE.stats['maintenance'] else 'غیرفعال 🟢'}")
 
 async def set_vip(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id not in ADMIN_IDS:
+    if update.effective_user.id not in CONFIG.admin_ids:
         return
     if context.args and context.args[0].isdigit():
         uid = int(context.args[0])
         u = get_user_record(uid)
         u["vip"] = not u.get("vip", False)
-        save_stats(stats)
-        await update.message.reply_text(
-            f"⭐ وضعیت VIP کاربر {uid}: {'فعال ✅' if u['vip'] else 'غیرفعال ❌'}"
-        )
+        STATE.save_stats()
+        await update.message.reply_text(f"⭐ وضعیت VIP کاربر {uid}: {'فعال ✅' if u['vip'] else 'غیرفعال ❌'}")
     else:
         await update.message.reply_text("استفاده: `/setvip USER_ID`", parse_mode=ParseMode.MARKDOWN)
 
 async def set_limit(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id not in ADMIN_IDS:
+    if update.effective_user.id not in CONFIG.admin_ids:
         return
     if context.args and context.args[0].isdigit():
         new_limit = int(context.args[0])
-        stats["daily_limit"] = max(1, min(new_limit, 1000))
-        save_stats(stats)
-        await update.message.reply_text(f"📆 سقف دانلود روزانه روی {stats['daily_limit']} تنظیم شد.")
+        STATE.stats["daily_limit"] = max(1, min(new_limit, 1000))
+        STATE.save_stats()
+        await update.message.reply_text(f"📆 سقف دانلود روزانه روی {STATE.stats['daily_limit']} تنظیم شد.")
     else:
         await update.message.reply_text("استفاده: `/limit 20`", parse_mode=ParseMode.MARKDOWN)
 
 async def users_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id not in ADMIN_IDS:
+    if update.effective_user.id not in CONFIG.admin_ids:
         return
     top_n = 20
     if context.args and context.args[0].isdigit():
         top_n = max(5, min(int(context.args[0]), 50))
     users = []
-    for uid, rec in stats["users"].items():
+    for uid, rec in STATE.stats["users"].items():
         users.append((
             int(uid),
             rec.get("count", 0),
@@ -903,16 +915,16 @@ async def users_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     lines = [f"👥 کاربران ثبت‌شده (نمایش {min(top_n, len(users))} نفر اول):\n"]
     for i, (uid, cnt, uname, seen, vip) in enumerate(users[:top_n], start=1):
-        display_uname = f'@{uname}' if uname not in ('-', '') else '-'
+        display_uname = f"@{uname}" if uname not in ("-", "") else "-"
         lines.append(f"{i}. ID: {uid} | {display_uname} | دانلود: {cnt} | VIP: {'بله' if vip else 'خیر'}")
     await update.message.reply_text("\n".join(lines))
 
 async def clearcache_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id not in ADMIN_IDS:
+    if update.effective_user.id not in CONFIG.admin_ids:
         return
-    clear_runtime_cache()
-    stats["telegram_cache"] = {}
-    save_stats(stats)
+    STATE.clear_runtime_cache()
+    STATE.stats["telegram_cache"] = {}
+    STATE.save_stats()
     await update.message.reply_text("🧹 کش‌ها پاک شدند.")
 
 async def ping_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -922,23 +934,23 @@ async def ping_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await msg.edit_text(f"🏓 Pong\n⏱ پاسخ: {elapsed}ms")
 
 # ---------------------------------------------------------------------------
-# پردازش لینک
+# Download flow
 # ---------------------------------------------------------------------------
 async def handle_links(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     await record_user(user.id, user.username)
 
-    if user.id in stats.get("banned", []):
+    if user.id in STATE.stats.get("banned", []):
         return
 
-    if stats.get("maintenance", False) and user.id not in ADMIN_IDS:
+    if STATE.stats.get("maintenance", False) and user.id not in CONFIG.admin_ids:
         await update.message.reply_text("🛠 ربات در حال تعمیرات است.")
         return
 
     if not await is_channel_member(context.bot, user.id):
         await update.message.reply_text(
             "⚠️ ابتدا در کانال ما عضو شوید:",
-            reply_markup=force_join_keyboard()
+            reply_markup=force_join_keyboard(),
         )
         return
 
@@ -963,7 +975,7 @@ async def handle_links(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def process_single_url(update: Update, context: ContextTypes.DEFAULT_TYPE, url: str):
     user = update.effective_user
-    if stats.get("maintenance", False) and user.id not in ADMIN_IDS:
+    if STATE.stats.get("maintenance", False) and user.id not in CONFIG.admin_ids:
         return
 
     if not check_daily_limit(user.id):
@@ -974,7 +986,7 @@ async def process_single_url(update: Update, context: ContextTypes.DEFAULT_TYPE,
         return
 
     short_id = uuid.uuid4().hex[:8]
-    url_cache[short_id] = url
+    STATE.url_cache[short_id] = url
 
     status_msg = await update.message.reply_text("🔎 در حال بررسی لینک...")
 
@@ -982,34 +994,19 @@ async def process_single_url(update: Update, context: ContextTypes.DEFAULT_TYPE,
     heights = []
     if preview_info:
         heights = get_available_heights(preview_info)
-        quality_cache[short_id] = heights
+        STATE.quality_cache[short_id] = heights
         preview_text = get_preview_text(preview_info, url)
         try:
-            await status_msg.edit_text(
-                preview_text,
-                reply_markup=quality_keyboard(short_id, heights)
-            )
+            await status_msg.edit_text(preview_text, reply_markup=quality_keyboard(short_id, heights))
         except Exception:
-            await status_msg.reply_text(
-                preview_text,
-                reply_markup=quality_keyboard(short_id, heights)
-            )
+            await status_msg.reply_text(preview_text, reply_markup=quality_keyboard(short_id, heights))
         return
 
     try:
-        await status_msg.edit_text(
-            "🎚 کیفیت مورد نظرت را انتخاب کن:",
-            reply_markup=quality_keyboard(short_id, heights)
-        )
+        await status_msg.edit_text("🎚 کیفیت مورد نظرت را انتخاب کن:", reply_markup=quality_keyboard(short_id, heights))
     except Exception:
-        await status_msg.reply_text(
-            "🎚 کیفیت مورد نظرت را انتخاب کن:",
-            reply_markup=quality_keyboard(short_id, heights)
-        )
+        await status_msg.reply_text("🎚 کیفیت مورد نظرت را انتخاب کن:", reply_markup=quality_keyboard(short_id, heights))
 
-# ---------------------------------------------------------------------------
-# دانلود
-# ---------------------------------------------------------------------------
 async def download_and_send(status_msg, user, url, quality, job_id, short_id):
     job_dir = os.path.join(DOWNLOAD_DIR, job_id)
     os.makedirs(job_dir, exist_ok=True)
@@ -1039,7 +1036,7 @@ async def download_and_send(status_msg, user, url, quality, job_id, short_id):
                 quality=quality,
                 size_bytes=cache_hit.get("size", 0),
                 site=site_from_url(url),
-                title=cache_hit.get("title", "")
+                title=cache_hit.get("title", ""),
             )
             increment_daily_count(user.id)
             try:
@@ -1052,7 +1049,7 @@ async def download_and_send(status_msg, user, url, quality, job_id, short_id):
 
     finally:
         unregister_active_job(ckey, job_id)
-        active_downloads.pop(job_id, None)
+        STATE.active_downloads.pop(job_id, None)
         for f in os.listdir(job_dir):
             try:
                 os.remove(os.path.join(job_dir, f))
@@ -1077,13 +1074,12 @@ async def _download_and_send_real(status_msg, user, url, quality, job_id, short_
         "merge_output_format": "mp4",
         "format": quality_to_format(quality),
         "extractor_args": {
-            "youtube": {"player_client": ["android", "web"]}
+            "youtube": {"player_client": ["android", "web"]},
         },
     }
 
-    cookiefile = os.environ.get("YTDLP_COOKIES_FILE", "").strip()
-    if cookiefile and os.path.exists(cookiefile):
-        ydl_opts["cookiefile"] = cookiefile
+    if CONFIG.ytdlp_cookies_file and os.path.exists(CONFIG.ytdlp_cookies_file):
+        ydl_opts["cookiefile"] = CONFIG.ytdlp_cookies_file
 
     if quality == "audio":
         ydl_opts["postprocessors"] = [{
@@ -1094,23 +1090,23 @@ async def _download_and_send_real(status_msg, user, url, quality, job_id, short_
 
     loop = asyncio.get_running_loop()
 
-    if download_semaphore.locked():
+    if STATE.download_semaphore.locked():
         pos = queue_waiting_count() + 1
         try:
             await status_msg.edit_text(
                 f"⏳ در صف دانلود هستید... ({pos} نفر جلوتر از شما)",
-                reply_markup=cancel_download_keyboard(job_id)
+                reply_markup=cancel_download_keyboard(job_id),
             )
         except Exception:
             pass
 
-    async with download_semaphore:
+    async with STATE.download_semaphore:
         for attempt in range(1, 4):
             try:
                 try:
                     await status_msg.edit_text(
                         f"⬇️ دانلود شروع شد\n🎚 کیفیت: {quality_label(quality)}\n⏳ لطفاً شکیبا باشید.",
-                        reply_markup=cancel_download_keyboard(job_id)
+                        reply_markup=cancel_download_keyboard(job_id),
                     )
                 except Exception:
                     pass
@@ -1206,13 +1202,15 @@ async def _download_and_send_real(status_msg, user, url, quality, job_id, short_
 
             except Exception as e:
                 logger.exception("خطا در دانلود (attempt %s)", attempt)
-                await record_error()
+                async with STATE.lock:
+                    STATE.stats["total_errors"] += 1
+                    STATE.save_stats()
 
                 if attempt < 3:
                     try:
                         await status_msg.edit_text(
                             f"⚠️ خطا در دانلود. تلاش مجدد {attempt + 1}/3 ...",
-                            reply_markup=cancel_download_keyboard(job_id)
+                            reply_markup=cancel_download_keyboard(job_id),
                         )
                     except Exception:
                         pass
@@ -1223,7 +1221,7 @@ async def _download_and_send_real(status_msg, user, url, quality, job_id, short_
                         await status_msg.edit_text(
                             f"❌ خطا در دانلود:\n`{err_text}`",
                             parse_mode=ParseMode.MARKDOWN,
-                            reply_markup=None
+                            reply_markup=None,
                         )
                     except Exception:
                         await status_msg.reply_text(f"❌ خطا در دانلود:\n{err_text}")
@@ -1239,11 +1237,11 @@ async def _download_and_send_real(status_msg, user, url, quality, job_id, short_
                     return
 
 async def record_download(user_id: int, url: str = "", quality: str = "", size_bytes: int = 0, site: str = "", title: str = ""):
-    async with stats_lock:
-        stats["total_downloads"] += 1
+    async with STATE.lock:
+        STATE.stats["total_downloads"] += 1
         uid = str(user_id)
-        if uid in stats["users"]:
-            rec = stats["users"][uid]
+        if uid in STATE.stats["users"]:
+            rec = STATE.stats["users"][uid]
             rec["count"] += 1
             rec["last_action"] = "download"
             rec["last_seen"] = now_iso()
@@ -1265,15 +1263,10 @@ async def record_download(user_id: int, url: str = "", quality: str = "", size_b
             rec.setdefault("history", [])
             rec["history"].insert(0, history_item)
             rec["history"] = rec["history"][:10]
-        save_stats(stats)
-
-async def record_error():
-    async with stats_lock:
-        stats["total_errors"] += 1
-        save_stats(stats)
+        STATE.save_stats()
 
 # ---------------------------------------------------------------------------
-# پاکسازی
+# Cleanup
 # ---------------------------------------------------------------------------
 async def cleanup_job(context: ContextTypes.DEFAULT_TYPE):
     now = time.time()
@@ -1286,14 +1279,14 @@ async def cleanup_job(context: ContextTypes.DEFAULT_TYPE):
                 mtime = os.path.getmtime(path)
             except Exception:
                 continue
-            if now - mtime > ORPHAN_MAX_AGE_SECONDS:
+            if now - mtime > CONFIG.orphan_max_age_seconds:
                 shutil.rmtree(path, ignore_errors=True)
                 logger.info("پوشه یتیم پاکسازی شد: %s", path)
     except Exception:
         logger.exception("خطا در پاکسازی خودکار")
 
 # ---------------------------------------------------------------------------
-# دکمه‌ها
+# Callback handler
 # ---------------------------------------------------------------------------
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -1314,10 +1307,9 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             u = get_user_record(user.id)
             if not u.get("joined_notified"):
                 u["joined_notified"] = True
-                save_stats(stats)
+                STATE.save_stats()
                 await query.message.edit_text(
-                    "✅ عضویت شما تایید شد. ممنون که به ما پیوستی 🙌\n"
-                    "حالا می‌تونی لینک بفرستی."
+                    "✅ عضویت شما تایید شد. ممنون که به ما پیوستی 🙌\nحالا می‌تونی لینک بفرستی."
                 )
             else:
                 await query.message.edit_text("✅ عضویت شما تایید شد. حالا می‌تونی لینک بفرستی.")
@@ -1327,23 +1319,24 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if data.startswith("settings_"):
         u = get_user_record(user.id)
+
         if data == "settings_lang":
             current = u.get("language", "fa")
             new_lang = "en" if current == "fa" else "fa"
             u["language"] = new_lang
-            save_stats(stats)
+            STATE.save_stats()
             await query.message.edit_text(f"🌐 زبان تغییر کرد: {new_lang}")
             return
 
         if data == "settings_dark":
             u["dark"] = not u.get("dark", False)
-            save_stats(stats)
+            STATE.save_stats()
             await query.message.edit_text(f"🌙 حالت شب: {'فعال ✅' if u['dark'] else 'خاموش ❌'}")
             return
 
         if data == "settings_notify":
             u["notify"] = not u.get("notify", True)
-            save_stats(stats)
+            STATE.save_stats()
             await query.message.edit_text(f"🔔 اعلان‌ها: {'فعال ✅' if u['notify'] else 'خاموش ❌'}")
             return
 
@@ -1351,7 +1344,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             u["notify"] = True
             u["dark"] = False
             u["language"] = "fa"
-            save_stats(stats)
+            STATE.save_stats()
             await query.message.edit_text("♻️ تنظیمات به حالت پیش‌فرض برگشت.")
             return
 
@@ -1371,9 +1364,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if data == "invite":
         await query.message.edit_text(
-            f"📢 لینک دعوت شما:\n\n"
-            f"`https://t.me/{context.bot.username}?start={user.id}`",
-            parse_mode=ParseMode.MARKDOWN
+            f"📢 لینک دعوت شما:\n\n`https://t.me/{context.bot.username}?start={user.id}`",
+            parse_mode=ParseMode.MARKDOWN,
         )
         return
 
@@ -1387,14 +1379,14 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data == "notify_on":
         u = get_user_record(user.id)
         u["notify"] = True
-        save_stats(stats)
+        STATE.save_stats()
         await query.message.edit_text("🔔 اعلان‌ها فعال شد ✅")
         return
 
     if data == "notify_off":
         u = get_user_record(user.id)
         u["notify"] = False
-        save_stats(stats)
+        STATE.save_stats()
         await query.message.edit_text("🔕 اعلان‌ها خاموش شد ❌")
         return
 
@@ -1423,17 +1415,17 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.message.edit_text("🕘 هنوز دانلودی ثبت نشده است.")
             return
         short_id = uuid.uuid4().hex[:8]
-        url_cache[short_id] = u["last_url"]
+        STATE.url_cache[short_id] = u["last_url"]
         last_quality = str(u.get("last_quality") or "best")
         if last_quality.isdigit():
-            quality_cache[short_id] = [int(last_quality)]
+            STATE.quality_cache[short_id] = [int(last_quality)]
         else:
-            quality_cache[short_id] = []
+            STATE.quality_cache[short_id] = []
         await query.message.edit_text(
             f"🔁 آخرین دانلود شما آماده است.\nکیفیت قبلی: {quality_label(last_quality)}",
             reply_markup=InlineKeyboardMarkup([
                 [InlineKeyboardButton("🔁 با همان کیفیت", callback_data=f"q:{last_quality}:{short_id}")],
-                [InlineKeyboardButton("🎚 انتخاب کیفیت دیگر", callback_data=f"redo:{short_id}")]
+                [InlineKeyboardButton("🎚 انتخاب کیفیت دیگر", callback_data=f"redo:{short_id}")],
             ])
         )
         return
@@ -1453,28 +1445,28 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.message.edit_text(
             f"🎁 کد دعوت شما:\n\n`{user.id}`\n\n"
             f"لینک دعوت:\n`https://t.me/{context.bot.username}?start={user.id}`",
-            parse_mode=ParseMode.MARKDOWN
+            parse_mode=ParseMode.MARKDOWN,
         )
         return
 
     if data.startswith("admin_"):
-        if user.id not in ADMIN_IDS:
+        if user.id not in CONFIG.admin_ids:
             await query.answer("⛔ دسترسی ندارید", show_alert=True)
             return
 
         if data == "admin_stats":
             await query.message.edit_text(
                 "📊 آمار ربات\n\n"
-                f"👥 کاربران: {len(stats['users'])}\n"
-                f"📥 دانلود موفق: {stats['total_downloads']}\n"
-                f"❌ خطاها: {stats['total_errors']}\n"
-                f"🚫 بن شده: {len(stats['banned'])}\n"
-                f"🛠 حالت تعمیرات: {'فعال' if stats.get('maintenance') else 'غیرفعال'}\n"
-                f"📢 ارسال همگانی: {stats.get('broadcast_count', 0)}\n"
-                f"⏳ دانلودهای فعال: {len(active_downloads)}\n"
-                f"🧠 کش فایل تلگرام: {len(stats.get('telegram_cache', {}))}\n"
+                f"👥 کاربران: {len(STATE.stats['users'])}\n"
+                f"📥 دانلود موفق: {STATE.stats['total_downloads']}\n"
+                f"❌ خطاها: {STATE.stats['total_errors']}\n"
+                f"🚫 بن شده: {len(STATE.stats['banned'])}\n"
+                f"🛠 حالت تعمیرات: {'فعال' if STATE.stats.get('maintenance') else 'غیرفعال'}\n"
+                f"📢 ارسال همگانی: {STATE.stats.get('broadcast_count', 0)}\n"
+                f"⏳ دانلودهای فعال: {len(STATE.active_downloads)}\n"
+                f"🧠 کش فایل تلگرام: {len(STATE.stats.get('telegram_cache', {}))}\n"
                 f"📆 سقف دانلود روزانه: {get_daily_limit()}",
-                reply_markup=admin_keyboard()
+                reply_markup=admin_keyboard(),
             )
             return
 
@@ -1485,14 +1477,14 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"📥 دانلودهای امروز: {today['downloads_today']}\n"
                 f"👤 کاربران فعال امروز: {today['active_users_today']}\n"
                 f"🔥 سایت محبوب امروز: {today['top_site']}",
-                reply_markup=admin_keyboard()
+                reply_markup=admin_keyboard(),
             )
             return
 
         if data == "admin_users":
             await query.message.edit_text(
-                f"👥 تعداد کاربران ثبت‌شده: {len(stats['users'])}",
-                reply_markup=admin_keyboard()
+                f"👥 تعداد کاربران ثبت‌شده: {len(STATE.stats['users'])}",
+                reply_markup=admin_keyboard(),
             )
             return
 
@@ -1501,7 +1493,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "🔎 برای دیدن اطلاعات کاربر از دستور زیر استفاده کن:\n\n"
                 "`/user USER_ID`",
                 parse_mode=ParseMode.MARKDOWN,
-                reply_markup=admin_keyboard()
+                reply_markup=admin_keyboard(),
             )
             return
 
@@ -1517,7 +1509,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "/user USER_ID\n"
                 "/clearcache\n"
                 "/ping",
-                reply_markup=admin_keyboard()
+                reply_markup=admin_keyboard(),
             )
             return
 
@@ -1530,14 +1522,14 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "• مدیریت کاربران\n"
                 "• ارسال همگانی\n"
                 f"• سقف دانلود روزانه: {get_daily_limit()}",
-                reply_markup=admin_keyboard()
+                reply_markup=admin_keyboard(),
             )
             return
 
         if data == "admin_maintenance":
-            stats["maintenance"] = not stats.get("maintenance", False)
-            save_stats(stats)
-            status = "فعال 🛠" if stats["maintenance"] else "غیرفعال 🟢"
+            STATE.stats["maintenance"] = not STATE.stats.get("maintenance", False)
+            STATE.save_stats()
+            status = "فعال 🛠" if STATE.stats["maintenance"] else "غیرفعال 🟢"
             await query.message.edit_text(f"حالت تعمیرات: {status}", reply_markup=admin_keyboard())
             return
 
@@ -1548,7 +1540,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "`/broadcast متن پیام`\n\n"
                 "یا روی یک پیام ریپلای کن و `/broadcast` بزن.",
                 parse_mode=ParseMode.MARKDOWN,
-                reply_markup=admin_keyboard()
+                reply_markup=admin_keyboard(),
             )
             return
 
@@ -1562,17 +1554,17 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if data.startswith("redo:"):
         short_id = data.split(":", 1)[1]
-        url = url_cache.get(short_id)
+        url = STATE.url_cache.get(short_id)
         if not url:
             await query.message.edit_text("⚠️ لینک منقضی شده، لینک رو دوباره بفرست.")
             return
-        heights = quality_cache.get(short_id, [])
+        heights = STATE.quality_cache.get(short_id, [])
         await query.message.edit_text("🎚 کیفیت مورد نظرت را انتخاب کن:", reply_markup=quality_keyboard(short_id, heights))
         return
 
     if data.startswith("cancel_dl:"):
         job_id = data.split(":", 1)[1]
-        task = active_downloads.get(job_id)
+        task = STATE.active_downloads.get(job_id)
         if task and not task.done():
             task.cancel()
         else:
@@ -1581,7 +1573,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if data.startswith("q:"):
         _, quality, short_id = data.split(":", 2)
-        url = url_cache.get(short_id)
+        url = STATE.url_cache.get(short_id)
         if not url:
             await query.message.reply_text("⚠️ لینک منقضی شده، دوباره بفرستید.")
             return
@@ -1591,7 +1583,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         ckey = cache_key(url, quality)
-        if ckey in active_url_jobs:
+        if ckey in STATE.active_url_jobs:
             await query.answer("⚠️ این لینک الان در حال پردازش است.", show_alert=True)
             return
 
@@ -1608,14 +1600,14 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         status_msg = await context.bot.send_message(
             chat_id=query.message.chat_id,
             text="⏳ در حال آماده‌سازی دانلود... لطفاً شکیبا باشید.",
-            reply_markup=cancel_download_keyboard(job_id)
+            reply_markup=cancel_download_keyboard(job_id),
         )
         task = asyncio.create_task(download_and_send(status_msg, user, url, quality, job_id, short_id))
-        active_downloads[job_id] = task
+        STATE.active_downloads[job_id] = task
         return
 
 # ---------------------------------------------------------------------------
-# منوی متنی
+# Menu text handler
 # ---------------------------------------------------------------------------
 async def menu_text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text
@@ -1664,10 +1656,10 @@ async def menu_text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await handle_links(update, context)
 
 # ---------------------------------------------------------------------------
-# اجرا
+# Main
 # ---------------------------------------------------------------------------
 def main():
-    app = ApplicationBuilder().token(BOT_TOKEN).build()
+    app = ApplicationBuilder().token(CONFIG.bot_token).build()
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_cmd))
@@ -1687,12 +1679,11 @@ def main():
     app.add_handler(CommandHandler("on", toggle_maintenance))
 
     app.add_handler(CallbackQueryHandler(button_handler))
-
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, menu_text_handler))
     app.add_handler(MessageHandler(filters.CAPTION & ~filters.COMMAND, handle_links))
 
     if app.job_queue is not None:
-        app.job_queue.run_repeating(cleanup_job, interval=1800, first=60)
+        app.job_queue.run_repeating(cleanup_job, interval=CONFIG.cleanup_interval_seconds, first=60)
     else:
         logger.warning(
             "JobQueue فعال نیست؛ برای پاکسازی خودکار پکیج "
