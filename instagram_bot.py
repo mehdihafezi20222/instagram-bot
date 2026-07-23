@@ -587,25 +587,41 @@ async def _download_direct_media_candidates(info: dict, job_dir: str, url: str) 
     saved_files = []
 
     def _download_one(candidate_url: str, index: int):
+        # اضافه کردن Referer و هدرهای بیشتر برای عبور از محدودیت‌ها
         headers = {
             "User-Agent": (
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                 "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-            )
+            ),
+            "Referer": url,
+            "Accept": "image/*,video/*,audio/*;q=0.9,*/*;q=0.8",
         }
         req = Request(candidate_url, headers=headers)
         with urlopen(req, timeout=30) as resp:
-            content_type = (resp.headers.get_content_type() if resp.headers else "") or ""
-            if not content_type.startswith(("image/", "video/", "audio/")):
-                # بعضی پاسخ‌ها چیز دیگری هستند؛ همان‌ها را ذخیره نکن
+            # سازگاری بیشتر با روش‌های مختلف سرور
+            content_type = (resp.headers.get("Content-Type") if resp.headers else "") or ""
+            ctype_main = content_type.split(";", 1)[0].strip().lower() if content_type else ""
+
+            # اگر Content-Type به‌صورت واضح فرمت مناسب نیست، اما URL پسوند دارد، قبولش کن
+            if ctype_main and not ctype_main.startswith(("image/", "video/", "audio/")):
+                # احتمال اینکه پاسخ HTML یا خطا باشد — نپذیرفتن
                 return None
+            if not ctype_main:
+                # اگر Content-Type خالی است، چک کن که URL خودش پسوند مناسب داشته باشد
+                path_ext = os.path.splitext(urlparse(candidate_url).path)[1].lower()
+                if not path_ext or path_ext not in IMAGE_EXTS + VIDEO_EXTS + AUDIO_EXTS:
+                    return None
 
             ext = _guess_ext_from_url_or_type(candidate_url, content_type)
             out_name = f"direct_{index:02d}{ext}"
             out_path = os.path.join(job_dir, out_name)
             with open(out_path, "wb") as f:
                 shutil.copyfileobj(resp, f)
-            return out_path
+
+            # مطمئن شو فایل حداقل چند بایت دارد
+            if os.path.exists(out_path) and os.path.getsize(out_path) > 0:
+                return out_path
+            return None
 
     for idx, candidate_url in enumerate(candidates[:12], start=1):
         try:
@@ -613,6 +629,7 @@ async def _download_direct_media_candidates(info: dict, job_dir: str, url: str) 
             if saved and os.path.exists(saved) and os.path.getsize(saved) > 0:
                 saved_files.append(saved)
         except Exception:
+            # اگر یک candidate شکست خورد، به بقیه ادامه بده
             continue
 
     return saved_files
