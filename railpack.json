@@ -1,7 +1,4 @@
 {
-  "$schema": "https://schema.railpack.com",
-  "deploy": {
-    "startCommand": "python instagram_bot.py",
-    "aptPackages": ["ffmpeg"]
-  }
+  "$schema": "https://railpack.com/schema.json",
+  "providers": ["python", "ffmpeg"]
 }
