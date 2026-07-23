@@ -461,8 +461,8 @@ def is_image_only(info: dict) -> bool:
     if not info.get("formats") and not info.get("entries"):
         if f".{ext}" in IMAGE_EXTS:
             return True
-        # نه عکس مشخص است، نه duration دارد => احتمالاً عکس است، ولی محتاطانه
-        return (not info.get("duration")) and bool(ext)
+        # اگر duration ندارد، احتمال زیاد عکس است؛ نبودن ext مانع تشخیص نشود
+        return not info.get("duration")
 
     formats = info.get("formats") or []
     if formats:
@@ -526,7 +526,9 @@ async def fetch_preview_info(url: str):
             "no_warnings": True,
             "ignoreerrors": True,
             "skip_download": True,
-            "noplaylist": "instagram.com" not in url.lower(),
+            # اگر لینک به یک آیتم مشخص از کاروسل اشاره دارد (img_index=)،
+            # فقط همان آیتم را بگیر، نه کل کاروسل را
+            "noplaylist": ("instagram.com" not in url.lower()) or ("img_index=" in url),
             "user_agent": (
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                 "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
@@ -1265,7 +1267,9 @@ async def _download_and_send_real(status_msg, user, url, quality, job_id, short_
         "quiet": True,
         "no_warnings": True,
         "ignoreerrors": True,
-        "noplaylist": "instagram.com" not in url.lower(),
+        # اگر لینک به یک آیتم مشخص از کاروسل اشاره دارد (img_index=)،
+        # فقط همان آیتم را بگیر، نه کل کاروسل را
+        "noplaylist": ("instagram.com" not in url.lower()) or ("img_index=" in url),
         "user_agent": (
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
             "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
