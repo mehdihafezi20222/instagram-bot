@@ -447,21 +447,34 @@ def is_image_only(info: dict) -> bool:
     """
     تشخیص می‌دهد که آیا محتوای این پست فقط عکس است (بدون هیچ فرمت ویدیویی).
     برای پست‌های عکسی اینستاگرام/فیسبوک/... این مورد True برمی‌گردد.
+
+    نکته‌ی مهم: فرمت‌های عکسی هم معمولاً فیلد height/width دارند، پس نباید
+    فقط بر اساس وجود 'height' تشخیص داد که فرمت ویدیویی است؛ ملاک اصلی
+    وجود کدک ویدیو (vcodec) است.
     """
     if not info:
         return False
+
     ext = (info.get("ext") or "").lower().strip(".")
-    if f".{ext}" in IMAGE_EXTS:
-        return True
+
+    # پست تکی که مستقیم یک فایل عکس است (بدون لیست formats)
+    if not info.get("formats") and not info.get("entries"):
+        if f".{ext}" in IMAGE_EXTS:
+            return True
+        # نه عکس مشخص است، نه duration دارد => احتمالاً عکس است، ولی محتاطانه
+        return (not info.get("duration")) and bool(ext)
+
     formats = info.get("formats") or []
     if formats:
-        has_video = any(
-            (f.get("vcodec") not in (None, "none")) or f.get("height")
-            for f in formats
-        )
+        has_video = any(f.get("vcodec") not in (None, "none") for f in formats)
         return not has_video
-    # اگر نه فرمت ویدیویی دارد و نه لیست فرمت، و duration هم صفر/خالی است، احتمالاً عکس است
-    return not info.get("duration")
+
+    # پست چند-آیتمی (کاروسل عکس/ویدیو ترکیبی)
+    entries = [e for e in (info.get("entries") or []) if e]
+    if entries:
+        return all(is_image_only(e) for e in entries)
+
+    return False
 
 def get_preview_text(info: dict, url: str) -> str:
     title = (info.get("title") or "").strip()
@@ -1394,6 +1407,30 @@ async def _download_and_send_real(status_msg, user, url, quality, job_id, short_
 
             except Exception as e:
                 logger.exception("خطا در دانلود (attempt %s)", attempt)
+
+                # اگر خطا مربوط به نبود فرمت ویدیویی است (یعنی احتمالاً این یک پست عکسی
+                # است که قبلاً به‌عنوان عکس تشخیص داده نشده)، فرمت ویدیویی را کنار بگذار
+                # و بدون شمردنش به‌عنوان یک تلاش شکست‌خورده‌ی معمولی، دوباره امتحان کن.
+                err_lower = str(e).lower()
+                is_format_error = (
+                    "requested format is not available" in err_lower
+                    or "no video formats found" in err_lower
+                    or "unable to extract" in err_lower and "format" in err_lower
+                )
+                if is_format_error and "format" in ydl_opts:
+                    logger.info("خطای فرمت شناسایی شد؛ تلاش دوباره بدون فرمت ویدیویی (احتمالاً پست عکسی است)")
+                    ydl_opts.pop("format", None)
+                    ydl_opts.pop("merge_output_format", None)
+                    ydl_opts.pop("postprocessors", None)
+                    try:
+                        await status_msg.edit_text(
+                            "🖼 به‌نظر می‌رسه این یک پست عکسی باشه، دوباره امتحان می‌کنم...",
+                            reply_markup=cancel_download_keyboard(job_id),
+                        )
+                    except Exception:
+                        pass
+                    continue
+
                 async with STATE.lock:
                     STATE.stats["total_errors"] += 1
                     STATE.save_stats()
