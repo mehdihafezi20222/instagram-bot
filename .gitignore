@@ -1,7 +1,9 @@
 __pycache__/
 *.pyc
+*.pyo
+*.pyd
 .env
-downloads/
 stats.json
-venv/
+downloads/
 .venv/
+venv/
