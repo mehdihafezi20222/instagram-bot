@@ -77,7 +77,7 @@ logger = logging.getLogger("instagram_downloader_bot")
 # ---------------------------------------------------------------------------
 DOWNLOAD_DIR = "downloads"
 STATS_FILE = "stats.json"
-CREDIT_MESSAGE = "🙏 با تشکر از امپراطور ۳۰"
+CREDIT_MESSAGE = "🙏 با تشکر از امپراطور ۳۱"
 
 SUPPORTED_DOMAINS = [
     "instagram.com", "youtube.com", "youtu.be",
@@ -137,6 +137,7 @@ class BotState:
         self.download_semaphore = asyncio.Semaphore(CONFIG.max_concurrent_downloads)
         self.active_downloads = {}
         self.active_url_jobs = {}
+        self.active_download_meta = {}
         self.stats = self.load_stats()
 
     def load_stats(self):
@@ -708,6 +709,29 @@ def cancel_download_keyboard(job_id: str):
 def redo_keyboard(short_id: str):
     return InlineKeyboardMarkup([[InlineKeyboardButton("🔁 دانلود دوباره با کیفیت دیگه", callback_data=f"redo:{short_id}")]])
 
+def build_history_keyboard(user_id: int):
+    """کیبورد تاریخچه حرفه‌ای: هر آیتم یک دکمه‌ی «دانلود دوباره» دارد."""
+    u = get_user_record(user_id)
+    history = u.get("history", [])[:10]
+    rows = []
+    for idx, item in enumerate(history, start=1):
+        url = item.get("url", "")
+        quality = str(item.get("quality") or "best")
+        if not url:
+            continue
+        short_id = uuid.uuid4().hex[:8]
+        STATE.url_cache[short_id] = url
+        if quality.isdigit():
+            STATE.quality_cache[short_id] = [int(quality)]
+        else:
+            STATE.quality_cache[short_id] = []
+        label = f"{idx}. {item.get('site') or site_from_url(url)} - {quality_label(quality)}"
+        rows.append([InlineKeyboardButton(f"🔁 {label}", callback_data=f"q:{quality}:{short_id}")])
+    if not rows:
+        return None
+    rows.append([InlineKeyboardButton("🔙 بازگشت", callback_data="back_main")])
+    return InlineKeyboardMarkup(rows)
+
 def force_join_keyboard():
     ch_clean = CONFIG.channel_username.replace("@", "")
     return InlineKeyboardMarkup([
@@ -933,6 +957,103 @@ async def ping_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elapsed = int((time.perf_counter() - start_t) * 1000)
     await msg.edit_text(f"🏓 Pong\n⏱ پاسخ: {elapsed}ms")
 
+async def live_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """آمار لحظه‌ای دانلودهای در حال اجرا (ادمین)."""
+    if update.effective_user.id not in CONFIG.admin_ids:
+        return
+    if not STATE.active_downloads:
+        await update.message.reply_text("📡 در حال حاضر دانلود فعالی وجود ندارد.")
+        return
+    lines = [f"📡 دانلودهای فعال ({len(STATE.active_downloads)}):\n"]
+    for job_id in list(STATE.active_downloads.keys()):
+        meta = STATE.active_download_meta.get(job_id, {})
+        uid = meta.get("user_id", "-")
+        uname = meta.get("username") or "-"
+        url = meta.get("url", "-")
+        quality = meta.get("quality", "-")
+        started = meta.get("started", "-")
+        lines.append(
+            f"🆔 {job_id} | 👤 {uid} (@{uname})\n"
+            f"🎚 {quality_label(quality)} | ⏰ شروع: {started}\n"
+            f"🔗 {url[:70]}\n"
+        )
+    await update.message.reply_text("\n".join(lines))
+
+async def ig_search_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """جستجوی چند پست اخیر یک پیج اینستاگرام: /ig username"""
+    user = update.effective_user
+    await record_user(user.id, user.username)
+
+    if user.id in STATE.stats.get("banned", []):
+        return
+
+    if not context.args:
+        await update.message.reply_text(
+            "استفاده: `/ig username` (بدون @)",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return
+
+    username = context.args[0].lstrip("@").strip()
+    if not username or not re.match(r"^[A-Za-z0-9._]+$", username):
+        await update.message.reply_text("⚠️ یوزرنیم نامعتبر است.")
+        return
+
+    status_msg = await update.message.reply_text(f"🔎 در حال جستجوی پست‌های @{username} ...")
+    profile_url = f"https://www.instagram.com/{username}/"
+    loop = asyncio.get_running_loop()
+
+    def _probe():
+        opts = {
+            "quiet": True,
+            "no_warnings": True,
+            "ignoreerrors": True,
+            "extract_flat": True,
+            "playlistend": 10,
+            "user_agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+            ),
+        }
+        if CONFIG.ytdlp_cookies_file and os.path.exists(CONFIG.ytdlp_cookies_file):
+            opts["cookiefile"] = CONFIG.ytdlp_cookies_file
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            return ydl.extract_info(profile_url, download=False)
+
+    try:
+        info = await loop.run_in_executor(None, _probe)
+    except Exception:
+        logger.exception("خطا در جستجوی اینستاگرام برای %s", username)
+        info = None
+
+    entries = [e for e in (info or {}).get("entries") or [] if e]
+
+    if not entries:
+        await status_msg.edit_text(
+            "❌ نتیجه‌ای پیدا نشد.\n"
+            "ممکن است پیج خصوصی باشد یا اینستاگرام دسترسی بدون‌لاگین را محدود کرده باشد."
+        )
+        return
+
+    buttons = []
+    for e in entries[:10]:
+        post_url = e.get("url") or e.get("webpage_url")
+        if not post_url:
+            continue
+        title = (e.get("title") or e.get("id") or "پست")[:30]
+        short_id = uuid.uuid4().hex[:8]
+        STATE.url_cache[short_id] = post_url
+        buttons.append([InlineKeyboardButton(f"⬇️ {title}", callback_data=f"redo:{short_id}")])
+
+    if not buttons:
+        await status_msg.edit_text("❌ لینک قابل دانلودی در پست‌های این پیج پیدا نشد.")
+        return
+
+    await status_msg.edit_text(
+        f"📸 آخرین پست‌های @{username}:\nروی هرکدام بزن تا کیفیت انتخاب کنی.",
+        reply_markup=InlineKeyboardMarkup(buttons),
+    )
+
 # ---------------------------------------------------------------------------
 # Download flow
 # ---------------------------------------------------------------------------
@@ -1050,6 +1171,7 @@ async def download_and_send(status_msg, user, url, quality, job_id, short_id):
     finally:
         unregister_active_job(ckey, job_id)
         STATE.active_downloads.pop(job_id, None)
+        STATE.active_download_meta.pop(job_id, None)
         for f in os.listdir(job_dir):
             try:
                 os.remove(os.path.join(job_dir, f))
@@ -1400,13 +1522,14 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not history:
             await query.message.edit_text("🕘 هنوز تاریخچه‌ای ثبت نشده است.")
             return
-        lines = ["🕘 تاریخچه دانلود شما:\n"]
+        lines = ["🕘 تاریخچه دانلود شما (برای دانلود دوباره روی دکمه بزن):\n"]
         for i, item in enumerate(history[:10], start=1):
             q = item.get("quality", "-")
-            url = item.get("url", "-")
-            title = item.get("title", "")
-            lines.append(f"{i}. کیفیت: {q}\n{title}\n{url}\n")
-        await query.message.edit_text("\n".join(lines))
+            title = item.get("title", "") or "-"
+            site = item.get("site") or site_from_url(item.get("url", ""))
+            lines.append(f"{i}. {site} | {quality_label(q)}\n{title[:60]}\n")
+        kb = build_history_keyboard(user.id)
+        await query.message.edit_text("\n".join(lines), reply_markup=kb)
         return
 
     if data == "last_download":
@@ -1508,7 +1631,9 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "/users [N]\n"
                 "/user USER_ID\n"
                 "/clearcache\n"
-                "/ping",
+                "/ping\n"
+                "/live (دانلودهای زنده)\n"
+                "/ig username (جستجوی اینستاگرام)",
                 reply_markup=admin_keyboard(),
             )
             return
@@ -1602,6 +1727,13 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             text="⏳ در حال آماده‌سازی دانلود... لطفاً شکیبا باشید.",
             reply_markup=cancel_download_keyboard(job_id),
         )
+        STATE.active_download_meta[job_id] = {
+            "user_id": user.id,
+            "username": user.username or "",
+            "url": url,
+            "quality": quality,
+            "started": now_iso(),
+        }
         task = asyncio.create_task(download_and_send(status_msg, user, url, quality, job_id, short_id))
         STATE.active_downloads[job_id] = task
         return
@@ -1675,6 +1807,8 @@ def main():
     app.add_handler(CommandHandler("user", user_info_cmd))
     app.add_handler(CommandHandler("clearcache", clearcache_cmd))
     app.add_handler(CommandHandler("ping", ping_cmd))
+    app.add_handler(CommandHandler("live", live_cmd))
+    app.add_handler(CommandHandler("ig", ig_search_cmd))
     app.add_handler(CommandHandler("off", toggle_maintenance))
     app.add_handler(CommandHandler("on", toggle_maintenance))
 
