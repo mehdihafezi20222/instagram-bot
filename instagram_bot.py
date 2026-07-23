@@ -488,7 +488,7 @@ async def fetch_preview_info(url: str):
             "no_warnings": True,
             "ignoreerrors": True,
             "skip_download": True,
-            "noplaylist": True,
+            "noplaylist": "instagram.com" not in url.lower(),
             "user_agent": (
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                 "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
@@ -1106,6 +1106,15 @@ async def process_single_url(update: Update, context: ContextTypes.DEFAULT_TYPE,
         )
         return
 
+    has_cookies = bool(CONFIG.ytdlp_cookies_file and os.path.exists(CONFIG.ytdlp_cookies_file))
+    if "/stories/" in urlparse(url).path.lower() and not has_cookies:
+        await update.message.reply_text(
+            "⚠️ دانلود استوری اینستاگرام نیاز به کوکی لاگین دارد؛ اینستاگرام این بخش را "
+            "حتی برای کاربران عمومی بدون لاگین بسته است.\n"
+            "این محدودیت خود اینستاگرام است، نه مشکل ربات. لینک‌های پست، ریلز و ویدیو عادی کار می‌کنند."
+        )
+        return
+
     short_id = uuid.uuid4().hex[:8]
     STATE.url_cache[short_id] = url
 
@@ -1188,7 +1197,7 @@ async def _download_and_send_real(status_msg, user, url, quality, job_id, short_
         "quiet": True,
         "no_warnings": True,
         "ignoreerrors": True,
-        "noplaylist": True,
+        "noplaylist": "instagram.com" not in url.lower(),
         "user_agent": (
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
             "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
