@@ -77,7 +77,7 @@ logger = logging.getLogger("instagram_downloader_bot")
 # ---------------------------------------------------------------------------
 DOWNLOAD_DIR = "downloads"
 STATS_FILE = "stats.json"
-CREDIT_MESSAGE = "🙏 با تشکر از امپراطور ۳۱"
+CREDIT_MESSAGE = "🙏 با تشکر از امپراطور ۳۳"
 
 SUPPORTED_DOMAINS = [
     "instagram.com", "youtube.com", "youtu.be",
@@ -476,6 +476,24 @@ def is_image_only(info: dict) -> bool:
 
     return False
 
+def infer_download_mode(info: dict | None, url: str = "") -> str:
+    """
+    خروجی را برای مسیر دانلود مشخص می‌کند:
+    - "image" برای پست‌های فقط عکس
+    - "video" برای بقیه
+    """
+    if info and is_image_only(info):
+        return "image"
+
+    if url:
+        try:
+            path_ext = os.path.splitext(urlparse(url).path)[1].lower()
+            if path_ext in IMAGE_EXTS:
+                return "image"
+        except Exception:
+            pass
+
+    return "video"
 def get_preview_text(info: dict, url: str) -> str:
     title = (info.get("title") or "").strip()
     duration = info.get("duration")
@@ -1183,7 +1201,7 @@ async def process_single_url(update: Update, context: ContextTypes.DEFAULT_TYPE,
             "started": now_iso(),
         }
         task = asyncio.create_task(
-            download_and_send(status_msg, user, url, "image", job_id, short_id)
+            download_and_send(status_msg, user, url, "image", job_id, short_id, preview_info=preview_info)
         )
         STATE.active_downloads[job_id] = task
         return
@@ -1205,7 +1223,7 @@ async def process_single_url(update: Update, context: ContextTypes.DEFAULT_TYPE,
     except Exception:
         await status_msg.reply_text("🎚 کیفیت مورد نظرت را انتخاب کن:", reply_markup=quality_keyboard(short_id, heights))
 
-async def download_and_send(status_msg, user, url, quality, job_id, short_id):
+async def download_and_send(status_msg, user, url, quality, job_id, short_id, preview_info=None):
     job_dir = os.path.join(DOWNLOAD_DIR, job_id)
     os.makedirs(job_dir, exist_ok=True)
 
@@ -1243,7 +1261,7 @@ async def download_and_send(status_msg, user, url, quality, job_id, short_id):
                 pass
             return
 
-        await _download_and_send_real(status_msg, user, url, quality, job_id, short_id, job_dir)
+        await _download_and_send_real(status_msg, user, url, quality, job_id, short_id, job_dir, preview_info=preview_info)
 
     finally:
         unregister_active_job(ckey, job_id)
@@ -1259,8 +1277,20 @@ async def download_and_send(status_msg, user, url, quality, job_id, short_id):
         except Exception:
             pass
 
-async def _download_and_send_real(status_msg, user, url, quality, job_id, short_id, job_dir):
-    is_image = str(quality).strip().lower() == "image"
+
+async def _download_and_send_real(status_msg, user, url, quality, job_id, short_id, job_dir, preview_info=None):
+    if preview_info is None:
+        preview_info = await fetch_preview_info(url)
+
+    inferred_mode = infer_download_mode(preview_info, url)
+    is_image = str(quality).strip().lower() == "image" or inferred_mode == "image"
+
+    if is_image and str(quality).strip().lower() == "audio":
+        try:
+            await status_msg.edit_text("⚠️ این پست فقط عکس است و خروجی صوتی ندارد.", reply_markup=None)
+        except Exception:
+            pass
+        return
 
     ydl_opts = {
         "outtmpl": f"{job_dir}/%(id)s_%(autonumber)s.%(ext)s",
@@ -1280,7 +1310,7 @@ async def _download_and_send_real(status_msg, user, url, quality, job_id, short_
     }
 
     # عکس‌ها نباید merge_output_format یا فرمت ویدیویی داشته باشند وگرنه yt-dlp شکست می‌خورد
-    fmt = quality_to_format(quality)
+    fmt = None if is_image else quality_to_format(quality)
     if fmt:
         ydl_opts["format"] = fmt
     if not is_image:
@@ -1845,7 +1875,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "quality": quality,
             "started": now_iso(),
         }
-        task = asyncio.create_task(download_and_send(status_msg, user, url, quality, job_id, short_id))
+        preview_info = await fetch_preview_info(url)
+        task = asyncio.create_task(download_and_send(status_msg, user, url, quality, job_id, short_id, preview_info=preview_info))
         STATE.active_downloads[job_id] = task
         return
 
